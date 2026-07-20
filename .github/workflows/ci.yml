@@ -18,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -69,26 +69,26 @@ jobs:
 
     steps:
       - name: Checkout quectel-qmi-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: quectel-qmi-go
 
       - name: Checkout VoHive
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ format('{0}/vohive', github.repository_owner) }}
           ref: main
           path: vohive
 
       - name: Checkout vowifi-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ format('{0}/vowifi-go', github.repository_owner) }}
           ref: main
           path: vowifi-go
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: vohive/go.mod
           cache: true
@@ -152,9 +152,9 @@ jobs:
           )
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: vohive/web/package-lock.json
 
