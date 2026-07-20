@@ -17,11 +17,12 @@ type ServiceVersion struct {
 // 获取 modem 支持的全部 QMI 服务及其版本号。
 //
 // 响应 TLV 0x01 格式：
-//   byte 0:     count (服务数量)
-//   byte 1..N:  每个条目 5 字节：
-//     uint8  service_type
-//     uint16 major_version (LE)
-//     uint16 minor_version (LE)
+//
+//	byte 0:     count (服务数量)
+//	byte 1..N:  每个条目 5 字节：
+//	  uint8  service_type
+//	  uint16 major_version (LE)
+//	  uint16 minor_version (LE)
 func (c *Client) GetServiceVersions(ctx context.Context) ([]ServiceVersion, error) {
 	resp, err := c.SendRequest(ctx, ServiceControl, 0, CTLGetVersionInfo, nil)
 	if err != nil {

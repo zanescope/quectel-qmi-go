@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/boa-z/quectel-qmi-go/pkg/device"
-	"github.com/boa-z/quectel-qmi-go/pkg/manager"
+	"github.com/zanescope/quectel-qmi-go/pkg/device"
+	"github.com/zanescope/quectel-qmi-go/pkg/manager"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"

@@ -1,4 +1,4 @@
-module github.com/boa-z/quectel-qmi-go
+module github.com/zanescope/quectel-qmi-go
 
 go 1.25.0
 

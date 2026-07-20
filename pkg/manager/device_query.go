@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boa-z/quectel-qmi-go/pkg/qmi"
+	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
 
 // ============================================================================

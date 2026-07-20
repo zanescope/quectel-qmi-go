@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/quectel-qmi-go/pkg/netcfg"
+	"github.com/zanescope/quectel-qmi-go/pkg/netcfg"
 )
 
 type fakeSIMCOMConfigurator struct {

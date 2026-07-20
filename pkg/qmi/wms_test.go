@@ -490,9 +490,9 @@ func TestDispatchWMSIndications(t *testing.T) {
 func TestNewWMSService_Unsupported(t *testing.T) {
 	// Create a dummy client where HasService returns false
 	client := &Client{}
-	client.versionQueried = true // mark as queried
+	client.versionQueried = true                        // mark as queried
 	client.serviceVersions = map[uint8]ServiceVersion{} // empty means nothing is supported
-	
+
 	_, err := NewWMSService(client)
 	if err != ErrServiceNotSupported {
 		t.Fatalf("expected ErrServiceNotSupported, got %v", err)

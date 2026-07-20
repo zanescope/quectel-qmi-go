@@ -15,11 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/boa-z/quectel-qmi-go/pkg/netcfg"
-	"github.com/boa-z/quectel-qmi-go/pkg/qmi"
 	"github.com/warthog618/sms"
 	"github.com/warthog618/sms/encoding/tpdu"
 	"github.com/warthog618/sms/encoding/ucs2"
+	"github.com/zanescope/quectel-qmi-go/pkg/netcfg"
+	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
 
 // ============================================================================

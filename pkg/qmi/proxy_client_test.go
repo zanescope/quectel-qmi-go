@@ -198,7 +198,6 @@ func TestAllocateClientIDWithContextUnknownServiceCacheFallsThrough(t *testing.T
 	}
 }
 
-
 func TestClientFallsBackToRawWhenProxyTransportOpenFails(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-fallback0"
 

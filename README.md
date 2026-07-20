@@ -70,7 +70,7 @@ quectel-qmi-go/
 ## 环境要求
 
 - Linux
-- Go `1.24+`
+- Go `1.25+`
 - 可访问的 QMI 控制节点，例如 `/dev/cdc-wdm0`
 - 可用的网络接口，例如 `wwan0`
 - 具备配置地址、路由、DNS 的权限
@@ -164,9 +164,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/boa-z/quectel-qmi-go/pkg/device"
-	"github.com/boa-z/quectel-qmi-go/pkg/manager"
-	"github.com/boa-z/quectel-qmi-go/pkg/qmi"
+	"github.com/zanescope/quectel-qmi-go/pkg/device"
+	"github.com/zanescope/quectel-qmi-go/pkg/manager"
+	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
 
 func main() {
