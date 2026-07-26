@@ -51,6 +51,9 @@ const (
 	EventUnknownIndication                                      // Unknown indication / 未知指示
 	EventVoiceSupplementaryServiceRequest                       // Voice supplementary service request indication / 语音补充业务请求指示
 	EventRecoveryExhausted                                      // qmi-go 内部核心恢复已彻底放弃 / core recovery abandoned
+	EventCoreRecoveryRequested                                  // Software core recovery accepted / 软件 Core 恢复请求已接受
+	EventCoreRecoverySucceeded                                  // Core recovery completed successfully / Core 恢复成功
+	EventCoreRecoveryFailed                                     // Core recovery attempt failed / Core 恢复失败
 )
 
 func (e EventType) String() string {
@@ -123,6 +126,12 @@ func (e EventType) String() string {
 		return "UnknownIndication"
 	case EventRecoveryExhausted:
 		return "RecoveryExhausted"
+	case EventCoreRecoveryRequested:
+		return "CoreRecoveryRequested"
+	case EventCoreRecoverySucceeded:
+		return "CoreRecoverySucceeded"
+	case EventCoreRecoveryFailed:
+		return "CoreRecoveryFailed"
 	default:
 		return "Unknown"
 	}

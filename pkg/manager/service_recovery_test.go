@@ -129,8 +129,8 @@ func TestDMSServiceTimeoutThresholdRebindsWithoutCoreRecovery(t *testing.T) {
 	if rebindCalls != 1 {
 		t.Fatalf("expected one rebind at timeout threshold, got %d", rebindCalls)
 	}
-	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventModemReset {
-		t.Fatalf("expected eventModemReset, got %v", evt)
+	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventCoreRecovery {
+		t.Fatalf("expected eventCoreRecovery, got %v", evt)
 	}
 	stats := m.Stats()
 	if stats.ServiceTimeouts != 4 {
@@ -168,8 +168,8 @@ func TestNASServiceTimeoutThresholdTriggersCoreRecovery(t *testing.T) {
 			t.Fatalf("attempt %d error=%v, want context deadline exceeded", i+1, err)
 		}
 	}
-	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventModemReset {
-		t.Fatalf("expected eventModemReset, got %v", evt)
+	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventCoreRecovery {
+		t.Fatalf("expected eventCoreRecovery, got %v", evt)
 	}
 }
 
@@ -469,8 +469,8 @@ func TestServiceRecoveryRebindFailureTriggersCoreRecovery(t *testing.T) {
 			}
 			if c.expectCoreRecovery {
 				evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second)
-				if evt != eventModemReset {
-					t.Fatalf("expected eventModemReset, got %v", evt)
+				if evt != eventCoreRecovery {
+					t.Fatalf("expected eventCoreRecovery, got %v", evt)
 				}
 				return
 			}
@@ -564,8 +564,8 @@ func TestServiceRecoveryRetryFailureTriggersCoreRecovery(t *testing.T) {
 			}
 			if c.expectCoreRecovery {
 				evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second)
-				if evt != eventModemReset {
-					t.Fatalf("expected eventModemReset, got %v", evt)
+				if evt != eventCoreRecovery {
+					t.Fatalf("expected eventCoreRecovery, got %v", evt)
 				}
 				return
 			}
@@ -589,8 +589,8 @@ func TestServiceRecoveryCooldownSuppressesRepeatedCoreRecovery(t *testing.T) {
 	_ = m.withNASRecovery("NAS.Op", func(nas *qmi.NASService) error {
 		return recoverableQMIError(qmi.ServiceNAS, qmi.NASGetServingSystem)
 	})
-	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventModemReset {
-		t.Fatalf("expected first event to be modem reset, got %v", evt)
+	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventCoreRecovery {
+		t.Fatalf("expected first event to be core recovery, got %v", evt)
 	}
 
 	m.ensureUIMServiceHook = func() (*qmi.UIMService, error) { return &qmi.UIMService{}, nil }
@@ -606,7 +606,7 @@ func TestServiceRecoveryCooldownSuppressesRepeatedCoreRecovery(t *testing.T) {
 	}
 }
 
-func TestRequestCoreRecoveryEnqueuesModemResetEvent(t *testing.T) {
+func TestRequestCoreRecoveryEnqueuesCoreRecoveryEvent(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.coreReady = true
 	m.state = StateDisconnected
@@ -614,8 +614,8 @@ func TestRequestCoreRecoveryEnqueuesModemResetEvent(t *testing.T) {
 	if !m.RequestCoreRecovery("post_switch_service_stalled") {
 		t.Fatal("RequestCoreRecovery() = false, want true")
 	}
-	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventModemReset {
-		t.Fatalf("expected eventModemReset, got %v", evt)
+	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventCoreRecovery {
+		t.Fatalf("expected eventCoreRecovery, got %v", evt)
 	}
 }
 
@@ -629,8 +629,8 @@ func TestRequestCoreRecoveryBypassesServiceRecoveryCooldown(t *testing.T) {
 	if !m.RequestCoreRecovery("post_switch_service_stalled") {
 		t.Fatal("RequestCoreRecovery() = false, want true despite service recovery cooldown")
 	}
-	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventModemReset {
-		t.Fatalf("expected eventModemReset, got %v", evt)
+	if evt := waitInternalRecoveryEvent(t, m.eventCh, time.Second); evt != eventCoreRecovery {
+		t.Fatalf("expected eventCoreRecovery, got %v", evt)
 	}
 }
 
@@ -824,9 +824,6 @@ func TestHandleModemResetEventCoalescesWhileRecovering(t *testing.T) {
 
 	if !m.modemResetPending {
 		t.Fatal("expected modemResetPending=true while coalescing")
-	}
-	if stats := m.Stats(); stats.ResetCoalesced < 1 {
-		t.Fatalf("expected reset_coalesced >= 1, got %d", stats.ResetCoalesced)
 	}
 }
 

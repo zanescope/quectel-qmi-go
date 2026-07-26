@@ -134,6 +134,11 @@ type ManagerStats struct {
 	StaleTimerIgnored        uint64
 	ResetEvents              uint64
 	ResetCoalesced           uint64
+	CoreRecoveryRequests     uint64
+	CoreRecoveryCoalesced    uint64
+	CoreRecoverySuppressed   uint64
+	CoreRecoverySuccess      uint64
+	CoreRecoveryFailures     uint64
 	RecoverAttempts          uint64
 	RecoverSuccess           uint64
 	RecoverBackoffMs         uint64
@@ -211,6 +216,11 @@ type Manager struct {
 	modemResetMu            sync.Mutex
 	modemResetRecovering    bool
 	modemResetPending       bool
+	modemResetEnqueued      bool
+	modemResetRequest       recoveryRequest
+	coreRecoveryEnqueued    bool
+	coreRecoveryRequest     recoveryRequest
+	currentRecoveryRequest  recoveryRequest
 	modemResetEnqueuedAt    time.Time
 	modemResetDedupWindow   time.Duration
 	modemResetQuietWindow   time.Duration
@@ -304,6 +314,11 @@ type Manager struct {
 	staleTimerIgnored        atomic.Uint64
 	resetEvents              atomic.Uint64
 	resetCoalesced           atomic.Uint64
+	coreRecoveryRequests     atomic.Uint64
+	coreRecoveryCoalesced    atomic.Uint64
+	coreRecoverySuppressed   atomic.Uint64
+	coreRecoverySuccess      atomic.Uint64
+	coreRecoveryFailures     atomic.Uint64
 	recoverAttempts          atomic.Uint64
 	recoverSuccess           atomic.Uint64
 	recoverBackoffMs         atomic.Uint64
@@ -325,6 +340,7 @@ const (
 	eventPacketStatusChanged                       // Packet service status changed indication / 数据包服务状态改变指示
 	eventServingSystemChanged                      // Serving system changed indication / 服务系统改变指示
 	eventModemReset                                // Modem reset indication / Modem重置指示
+	eventCoreRecovery                              // Software core recovery request / 软件 Core 恢复请求
 )
 
 var defaultRetryDelays = []time.Duration{
@@ -948,6 +964,11 @@ func (m *Manager) Stats() ManagerStats {
 		StaleTimerIgnored:        m.staleTimerIgnored.Load(),
 		ResetEvents:              m.resetEvents.Load(),
 		ResetCoalesced:           m.resetCoalesced.Load(),
+		CoreRecoveryRequests:     m.coreRecoveryRequests.Load(),
+		CoreRecoveryCoalesced:    m.coreRecoveryCoalesced.Load(),
+		CoreRecoverySuppressed:   m.coreRecoverySuppressed.Load(),
+		CoreRecoverySuccess:      m.coreRecoverySuccess.Load(),
+		CoreRecoveryFailures:     m.coreRecoveryFailures.Load(),
 		RecoverAttempts:          m.recoverAttempts.Load(),
 		RecoverSuccess:           m.recoverSuccess.Load(),
 		RecoverBackoffMs:         m.recoverBackoffMs.Load(),
@@ -2957,45 +2978,54 @@ func (m *Manager) handleEvent(evt internalEvent) {
 		m.log.Debug("Received indication - scheduling status check")
 		m.scheduleTargetedCheck()
 
-	case eventModemReset:
-		m.handleModemResetEvent()
+	case eventModemReset, eventCoreRecovery:
+		m.handleRecoveryEvent(evt)
 	}
 }
 
 func (m *Manager) handleModemResetEvent() {
+	m.handleRecoveryEvent(eventModemReset)
+}
+
+func (m *Manager) handleRecoveryEvent(event internalEvent) {
 	if m == nil {
 		return
 	}
 
-	m.modemResetMu.Lock()
-	if m.modemResetRecovering {
-		m.modemResetPending = true
-		m.resetCoalesced.Add(1)
-		m.modemResetMu.Unlock()
-		m.log.Debug("Skip duplicated modem reset event while recovery is running")
+	request, ok := m.beginRecovery(event)
+	if !ok {
 		return
 	}
-	m.modemResetRecovering = true
-	m.modemResetPending = false
-	m.modemResetMu.Unlock()
 
-	m.log.Warn("Modem reset detected!")
-	recovered := m.doRecoverFromModemReset()
-
-	m.modemResetMu.Lock()
-	m.modemResetRecovering = false
-	pending := m.modemResetPending
-	m.modemResetPending = false
-	m.modemResetMu.Unlock()
-
-	if pending {
-		if recovered {
-			m.log.Warn("Processing coalesced modem reset event after previous recovery")
-		} else {
-			m.log.Warn("Processing coalesced modem reset event after failed recovery attempt")
-		}
-		m.enqueueModemResetEvent("pending_after_recovery")
+	entry := m.coreRecoveryLogger().
+		WithField("recovery_reason", request.reason).
+		WithField("recovery_detail", request.detail)
+	if request.retry {
+		entry.Warn("Retrying core recovery")
+	} else if request.kind == recoveryKindModemReset {
+		entry.Warn("Modem reset detected")
+	} else {
+		entry.Warn("Core recovery requested")
 	}
+
+	recovered := m.doRecoverCore(request)
+	if recovered {
+		m.coreRecoverySuccess.Add(1)
+		m.emitEvent(Event{
+			Type:   EventCoreRecoverySucceeded,
+			State:  m.State(),
+			Reason: string(request.reason),
+		})
+	} else {
+		m.coreRecoveryFailures.Add(1)
+		m.emitEvent(Event{
+			Type:   EventCoreRecoveryFailed,
+			State:  m.State(),
+			Reason: string(request.reason),
+		})
+	}
+
+	m.finishRecovery()
 }
 
 func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
@@ -3071,6 +3101,10 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 }
 
 func (m *Manager) doRecoverFromModemReset() bool {
+	return m.doRecoverCore(modemResetRecoveryRequest("direct"))
+}
+
+func (m *Manager) doRecoverCore(request recoveryRequest) bool {
 	m.mu.RLock()
 	desiredConnection := m.desiredConnection
 	isStopping := m.state == StateStopping
@@ -3108,7 +3142,7 @@ func (m *Manager) doRecoverFromModemReset() bool {
 			m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Error: openErr, Reason: "device_removed"})
 			return false
 		}
-		m.scheduleRecoverRetry("reinit_failed")
+		m.scheduleRecoverRetryFor(request, "reinit_failed")
 		return false
 	}
 	m.mu.Lock()
@@ -3122,7 +3156,7 @@ func (m *Manager) doRecoverFromModemReset() bool {
 		checkSIMErr = m.checkSIM()
 	}
 	if checkSIMErr != nil {
-		m.log.WithError(checkSIMErr).Warn("SIM check failed after modem reset")
+		m.log.WithError(checkSIMErr).Warn("SIM check failed after core recovery")
 	}
 
 	m.mu.Lock()
@@ -3137,7 +3171,7 @@ func (m *Manager) doRecoverFromModemReset() bool {
 		m.mu.Unlock()
 		m.log.WithError(quietErr).Warn("QMI reset quiet-window gate not satisfied")
 		if !m.hasPendingModemReset() {
-			m.scheduleRecoverRetry("quiet_window")
+			m.scheduleRecoverRetryFor(request, "quiet_window")
 		}
 		return false
 	}
@@ -3271,12 +3305,21 @@ func (m *Manager) recoveryExhausted() bool {
 }
 
 func (m *Manager) scheduleRecoverRetry(reason string) {
+	request := m.currentRecovery()
+	if request.reason == "" {
+		request = explicitRecoveryRequest("recover_retry")
+	}
+	m.scheduleRecoverRetryFor(request, reason)
+}
+
+func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string) {
 	m.recoverCount++
 	if m.recoverFirstFailAt.IsZero() {
 		m.recoverFirstFailAt = time.Now()
 	}
 	if m.recoveryExhausted() {
 		m.log.WithField("reason", reason).
+			WithField("recovery_reason", request.reason).
 			WithField("attempts", m.recoverCount).
 			Warn("Core recovery exhausted; emitting terminal event and stopping retries")
 		m.recoverCount = 0
@@ -3285,9 +3328,12 @@ func (m *Manager) scheduleRecoverRetry(reason string) {
 		return
 	}
 	delay := m.getRecoverDelay()
-	m.log.WithField("reason", reason).Infof("Will retry reinit with backoff in %v (attempt=%d)", delay, m.recoverCount)
+	m.log.
+		WithField("reason", reason).
+		WithField("recovery_reason", request.reason).
+		Infof("Will retry core recovery with backoff in %v (attempt=%d)", delay, m.recoverCount)
 	m.scheduleAfter(delay, func() {
-		m.enqueueModemResetEvent("recover_retry")
+		m.enqueueCoreRecoveryRetry(request, reason)
 	})
 }
 

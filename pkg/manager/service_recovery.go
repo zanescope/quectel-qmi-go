@@ -169,7 +169,7 @@ func (m *Manager) detectTimeoutStorm(service string) {
 			m.globalTimeoutServices = make(map[string]time.Time)
 			m.log.Warn("Timeout storm detected; triggering immediate core recovery",
 				"services_affected", len(m.globalTimeoutServices))
-			m.enqueueModemResetEvent("timeout_storm")
+			m.enqueueCoreRecoveryEvent(recoveryRequest{kind: recoveryKindSoftware, reason: recoveryReasonServiceTimeoutStorm, detail: service})
 		}
 	}
 }
@@ -210,12 +210,13 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 		return false
 	}
 
+	request := serviceRecoveryRequest(service, op, phase, cause)
 	m.mu.RLock()
 	coreReady := m.coreReady
 	stopping := m.state == StateStopping
 	m.mu.RUnlock()
 	if !coreReady || stopping {
-		return false
+		return m.enqueueCoreRecoveryEvent(request)
 	}
 
 	cooldown := m.uimRecoverCooldown
@@ -237,8 +238,17 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 	m.uimLastRecoverSignal = now
 	m.uimRecoveryMu.Unlock()
 
-	m.logServiceRecovery(service, op, "recover-core", cause, "Scheduling core recovery due to service failure")
-	m.enqueueModemResetEvent(strings.ToLower(service) + "_recovery")
+	if !m.enqueueCoreRecoveryEvent(request) {
+		return false
+	}
+	m.log.
+		WithField("service_name", service).
+		WithField("op", op).
+		WithField("phase", "recover-core").
+		WithField("recovery_reason", request.reason).
+		WithField("recovery_detail", request.detail).
+		WithError(cause).
+		Warn("Scheduling core recovery due to service failure")
 	return true
 }
 
@@ -255,17 +265,14 @@ func (m *Manager) RequestCoreRecovery(reason string) bool {
 		reason = "external_request"
 	}
 
-	m.mu.RLock()
-	coreReady := m.coreReady
-	stopping := m.state == StateStopping
-	m.mu.RUnlock()
-	if !coreReady || stopping {
+	request := explicitRecoveryRequest(reason)
+	if !m.enqueueCoreRecoveryEvent(request) {
 		return false
 	}
-
-	cause := fmt.Errorf("%s", reason)
-	m.logServiceRecovery("POST_SWITCH", reason, "recover-core", cause, "Scheduling core recovery due to explicit request")
-	m.enqueueModemResetEvent("post_switch_recovery")
+	m.log.
+		WithField("recovery_reason", request.reason).
+		WithField("recovery_detail", request.detail).
+		Warn("Core recovery requested")
 	return true
 }
 

@@ -2,7 +2,6 @@ package manager
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
@@ -163,82 +162,6 @@ func (m *Manager) shouldRecoverUIMError(op string, err error) bool {
 
 func (m *Manager) triggerCoreRecoveryFromUIM(op string, phase string, cause error) {
 	m.triggerCoreRecoveryFromService("UIM", op, phase, cause)
-}
-
-func (m *Manager) enqueueModemResetEvent(source string) {
-	if m == nil {
-		return
-	}
-	m.resetEvents.Add(1)
-
-	now := time.Now()
-	m.modemResetMu.Lock()
-	if m.modemResetRecovering {
-		m.modemResetPending = true
-		m.resetCoalesced.Add(1)
-		m.modemResetMu.Unlock()
-		m.log.WithField("source", source).Debug("Coalesced modem-reset event while recovery is running")
-		return
-	}
-	if !m.modemResetEnqueuedAt.IsZero() && now.Sub(m.modemResetEnqueuedAt) < m.modemResetDedupWindow {
-		m.resetCoalesced.Add(1)
-		m.modemResetMu.Unlock()
-		m.log.WithField("source", source).Debug("Deduplicated modem-reset event inside debounce window")
-		return
-	}
-	m.modemResetEnqueuedAt = now
-	m.modemResetMu.Unlock()
-
-	select {
-	case m.eventCh <- eventModemReset:
-		return
-	default:
-		m.modemResetMu.Lock()
-		if m.modemResetDeferred {
-			m.modemResetPending = true
-			m.resetCoalesced.Add(1)
-			m.modemResetMu.Unlock()
-			m.log.WithField("source", source).Debug("Deferred modem-reset enqueue already scheduled")
-			return
-		}
-		m.modemResetDeferred = true
-		m.modemResetMu.Unlock()
-		m.log.WithField("source", source).Warn("Internal event queue is full; scheduling deferred modem-reset event")
-	}
-
-	m.scheduleAfter(200*time.Millisecond, func() {
-		m.modemResetMu.Lock()
-		m.modemResetDeferred = false
-		if m.modemResetRecovering {
-			m.modemResetPending = true
-			m.resetCoalesced.Add(1)
-			m.modemResetMu.Unlock()
-			return
-		}
-		m.modemResetEnqueuedAt = time.Now()
-		m.modemResetMu.Unlock()
-
-		select {
-		case m.eventCh <- eventModemReset:
-		default:
-			m.modemResetMu.Lock()
-			if !m.modemResetDeferred {
-				m.modemResetDeferred = true
-			}
-			m.modemResetPending = true
-			m.resetCoalesced.Add(1)
-			m.modemResetMu.Unlock()
-			m.log.WithField("source", source).Warn("Deferred modem-reset event still blocked; retrying enqueue")
-			m.scheduleAfter(500*time.Millisecond, func() {
-				m.modemResetMu.Lock()
-				m.modemResetDeferred = false
-				// clear debounce timestamp so deferred retry is not swallowed by dedup window
-				m.modemResetEnqueuedAt = time.Time{}
-				m.modemResetMu.Unlock()
-				m.enqueueModemResetEvent(source + "_deferred_retry")
-			})
-		}
-	})
 }
 
 func (m *Manager) logUIMRecovery(op string, phase string, err error, message string) {
