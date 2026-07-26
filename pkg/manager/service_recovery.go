@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,8 +128,9 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 		WithField("timeout_count", state.count).
 		WithField("timeout_threshold", threshold).
 		WithField("timeout_window_ms", window.Milliseconds())
-
-	m.detectTimeoutStorm(key.service)
+	if firstReached {
+		m.detectTimeoutStorm(key.service)
+	}
 
 	if reached {
 		if firstReached {
@@ -148,30 +150,78 @@ func (m *Manager) detectTimeoutStorm(service string) {
 	const stormMinSvcs = 2
 	const stormCooldown = 30 * time.Second
 
-	m.globalTimeoutMu.Lock()
-	defer m.globalTimeoutMu.Unlock()
+	service = strings.ToUpper(strings.TrimSpace(service))
+	if service == "" {
+		return
+	}
+	if !m.canDetectTimeoutStorm() {
+		m.clearTimeoutStormCandidates()
+		return
+	}
 
 	now := time.Now()
+	var affectedServices []string
+
+	m.globalTimeoutMu.Lock()
 	if m.globalTimeoutServices == nil {
 		m.globalTimeoutServices = make(map[string]time.Time)
 	}
-
-	for svc, t := range m.globalTimeoutServices {
-		if now.Sub(t) > stormWindow {
-			delete(m.globalTimeoutServices, svc)
+	for candidate, observedAt := range m.globalTimeoutServices {
+		if now.Sub(observedAt) > stormWindow {
+			delete(m.globalTimeoutServices, candidate)
 		}
 	}
 	m.globalTimeoutServices[service] = now
 
-	if len(m.globalTimeoutServices) >= stormMinSvcs {
-		if m.globalTimeoutStormAt.IsZero() || now.Sub(m.globalTimeoutStormAt) > stormCooldown {
-			m.globalTimeoutStormAt = now
-			m.globalTimeoutServices = make(map[string]time.Time)
-			m.log.Warn("Timeout storm detected; triggering immediate core recovery",
-				"services_affected", len(m.globalTimeoutServices))
-			m.enqueueModemResetEvent("timeout_storm")
+	if len(m.globalTimeoutServices) >= stormMinSvcs &&
+		(m.globalTimeoutStormAt.IsZero() || now.Sub(m.globalTimeoutStormAt) > stormCooldown) {
+		affectedServices = make([]string, 0, len(m.globalTimeoutServices))
+		for candidate := range m.globalTimeoutServices {
+			affectedServices = append(affectedServices, candidate)
 		}
+		sort.Strings(affectedServices)
+		m.globalTimeoutStormAt = now
+		m.globalTimeoutServices = make(map[string]time.Time)
 	}
+	m.globalTimeoutMu.Unlock()
+
+	if len(affectedServices) == 0 {
+		return
+	}
+
+	request := recoveryRequest{
+		kind:   recoveryKindSoftware,
+		reason: recoveryReasonServiceTimeoutStorm,
+		detail: strings.Join(affectedServices, ","),
+	}
+	if !m.enqueueCoreRecoveryEvent(request) {
+		return
+	}
+	m.log.
+		WithField("services_affected", len(affectedServices)).
+		WithField("services", affectedServices).
+		Warn("Timeout storm detected; triggering core recovery")
+}
+
+func (m *Manager) canDetectTimeoutStorm() bool {
+	m.mu.RLock()
+	coreReady := m.coreReady
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if !coreReady || stopping {
+		return false
+	}
+
+	m.modemResetMu.Lock()
+	recoveryPending := m.modemResetRecovering || m.modemResetEnqueued || m.coreRecoveryEnqueued
+	m.modemResetMu.Unlock()
+	return !recoveryPending
+}
+
+func (m *Manager) clearTimeoutStormCandidates() {
+	m.globalTimeoutMu.Lock()
+	m.globalTimeoutServices = nil
+	m.globalTimeoutMu.Unlock()
 }
 
 func (m *Manager) noteServiceOperationSuccess(service string, op string) {
@@ -210,12 +260,13 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 		return false
 	}
 
+	request := serviceRecoveryRequest(service, op, phase, cause)
 	m.mu.RLock()
 	coreReady := m.coreReady
 	stopping := m.state == StateStopping
 	m.mu.RUnlock()
 	if !coreReady || stopping {
-		return false
+		return m.enqueueCoreRecoveryEvent(request)
 	}
 
 	cooldown := m.uimRecoverCooldown
@@ -237,8 +288,17 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 	m.uimLastRecoverSignal = now
 	m.uimRecoveryMu.Unlock()
 
-	m.logServiceRecovery(service, op, "recover-core", cause, "Scheduling core recovery due to service failure")
-	m.enqueueModemResetEvent(strings.ToLower(service) + "_recovery")
+	if !m.enqueueCoreRecoveryEvent(request) {
+		return false
+	}
+	m.log.
+		WithField("service_name", service).
+		WithField("op", op).
+		WithField("phase", "recover-core").
+		WithField("recovery_reason", request.reason).
+		WithField("recovery_detail", request.detail).
+		WithError(cause).
+		Warn("Scheduling core recovery due to service failure")
 	return true
 }
 
@@ -255,17 +315,14 @@ func (m *Manager) RequestCoreRecovery(reason string) bool {
 		reason = "external_request"
 	}
 
-	m.mu.RLock()
-	coreReady := m.coreReady
-	stopping := m.state == StateStopping
-	m.mu.RUnlock()
-	if !coreReady || stopping {
+	request := explicitRecoveryRequest(reason)
+	if !m.enqueueCoreRecoveryEvent(request) {
 		return false
 	}
-
-	cause := fmt.Errorf("%s", reason)
-	m.logServiceRecovery("POST_SWITCH", reason, "recover-core", cause, "Scheduling core recovery due to explicit request")
-	m.enqueueModemResetEvent("post_switch_recovery")
+	m.log.
+		WithField("recovery_reason", request.reason).
+		WithField("recovery_detail", request.detail).
+		Warn("Core recovery requested")
 	return true
 }
 
