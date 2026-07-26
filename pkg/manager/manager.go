@@ -2996,6 +2996,7 @@ func (m *Manager) handleRecoveryEvent(event internalEvent) {
 	if !ok {
 		return
 	}
+	m.clearTimeoutStormCandidates()
 
 	entry := m.coreRecoveryLogger().
 		WithField("recovery_reason", request.reason).

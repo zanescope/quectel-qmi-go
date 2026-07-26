@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,8 +128,9 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 		WithField("timeout_count", state.count).
 		WithField("timeout_threshold", threshold).
 		WithField("timeout_window_ms", window.Milliseconds())
-
-	m.detectTimeoutStorm(key.service)
+	if firstReached {
+		m.detectTimeoutStorm(key.service)
+	}
 
 	if reached {
 		if firstReached {
@@ -148,30 +150,78 @@ func (m *Manager) detectTimeoutStorm(service string) {
 	const stormMinSvcs = 2
 	const stormCooldown = 30 * time.Second
 
-	m.globalTimeoutMu.Lock()
-	defer m.globalTimeoutMu.Unlock()
+	service = strings.ToUpper(strings.TrimSpace(service))
+	if service == "" {
+		return
+	}
+	if !m.canDetectTimeoutStorm() {
+		m.clearTimeoutStormCandidates()
+		return
+	}
 
 	now := time.Now()
+	var affectedServices []string
+
+	m.globalTimeoutMu.Lock()
 	if m.globalTimeoutServices == nil {
 		m.globalTimeoutServices = make(map[string]time.Time)
 	}
-
-	for svc, t := range m.globalTimeoutServices {
-		if now.Sub(t) > stormWindow {
-			delete(m.globalTimeoutServices, svc)
+	for candidate, observedAt := range m.globalTimeoutServices {
+		if now.Sub(observedAt) > stormWindow {
+			delete(m.globalTimeoutServices, candidate)
 		}
 	}
 	m.globalTimeoutServices[service] = now
 
-	if len(m.globalTimeoutServices) >= stormMinSvcs {
-		if m.globalTimeoutStormAt.IsZero() || now.Sub(m.globalTimeoutStormAt) > stormCooldown {
-			m.globalTimeoutStormAt = now
-			m.globalTimeoutServices = make(map[string]time.Time)
-			m.log.Warn("Timeout storm detected; triggering immediate core recovery",
-				"services_affected", len(m.globalTimeoutServices))
-			m.enqueueCoreRecoveryEvent(recoveryRequest{kind: recoveryKindSoftware, reason: recoveryReasonServiceTimeoutStorm, detail: service})
+	if len(m.globalTimeoutServices) >= stormMinSvcs &&
+		(m.globalTimeoutStormAt.IsZero() || now.Sub(m.globalTimeoutStormAt) > stormCooldown) {
+		affectedServices = make([]string, 0, len(m.globalTimeoutServices))
+		for candidate := range m.globalTimeoutServices {
+			affectedServices = append(affectedServices, candidate)
 		}
+		sort.Strings(affectedServices)
+		m.globalTimeoutStormAt = now
+		m.globalTimeoutServices = make(map[string]time.Time)
 	}
+	m.globalTimeoutMu.Unlock()
+
+	if len(affectedServices) == 0 {
+		return
+	}
+
+	request := recoveryRequest{
+		kind:   recoveryKindSoftware,
+		reason: recoveryReasonServiceTimeoutStorm,
+		detail: strings.Join(affectedServices, ","),
+	}
+	if !m.enqueueCoreRecoveryEvent(request) {
+		return
+	}
+	m.log.
+		WithField("services_affected", len(affectedServices)).
+		WithField("services", affectedServices).
+		Warn("Timeout storm detected; triggering core recovery")
+}
+
+func (m *Manager) canDetectTimeoutStorm() bool {
+	m.mu.RLock()
+	coreReady := m.coreReady
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if !coreReady || stopping {
+		return false
+	}
+
+	m.modemResetMu.Lock()
+	recoveryPending := m.modemResetRecovering || m.modemResetEnqueued || m.coreRecoveryEnqueued
+	m.modemResetMu.Unlock()
+	return !recoveryPending
+}
+
+func (m *Manager) clearTimeoutStormCandidates() {
+	m.globalTimeoutMu.Lock()
+	m.globalTimeoutServices = nil
+	m.globalTimeoutMu.Unlock()
 }
 
 func (m *Manager) noteServiceOperationSuccess(service string, op string) {
