@@ -322,7 +322,7 @@ func (m *Manager) RequestCoreRecovery(reason string) bool {
 	m.log.
 		WithField("recovery_reason", request.reason).
 		WithField("recovery_detail", request.detail).
-		Warn("Core recovery requested")
+		Debug("Core recovery queued")
 	return true
 }
 
