@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -130,5 +132,82 @@ func TestOpenProxyTransportRetriesUntilProxyIsReady(t *testing.T) {
 	}
 	if attempts != 4 {
 		t.Fatalf("dial attempts=%d, want 4", attempts)
+	}
+}
+
+func TestOpenProxyTransportStartsSharedProxyOnce(t *testing.T) {
+	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
+	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDial := dialProxyHook
+	oldStart := startProxyProcessHook
+	oldRetryDelay := proxyRetryDelay
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		startProxyProcessHook = oldStart
+		proxyRetryDelay = oldRetryDelay
+	})
+
+	var ready atomic.Bool
+	var starts atomic.Int32
+	var peersMu sync.Mutex
+	var peers []net.Conn
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		if !ready.Load() {
+			return nil, errors.New("proxy socket not ready")
+		}
+		client, server := net.Pipe()
+		peersMu.Lock()
+		peers = append(peers, server)
+		peersMu.Unlock()
+		return client, nil
+	}
+
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	var signalStart sync.Once
+	startProxyProcessHook = func(string) error {
+		starts.Add(1)
+		signalStart.Do(func() { close(startEntered) })
+		<-releaseStart
+		ready.Store(true)
+		return nil
+	}
+	proxyRetryDelay = time.Millisecond
+
+	const callers = 8
+	errCh := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, err := openProxyTransport(ctx, ClientOptions{
+				ProxyPath:       "@qmi-proxy",
+				ProxyExecutable: proxyExecutable,
+			})
+			if conn != nil {
+				_ = conn.Close()
+			}
+			errCh <- err
+		}()
+	}
+
+	<-startEntered
+	time.Sleep(20 * time.Millisecond)
+	close(releaseStart)
+	for i := 0; i < callers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("openProxyTransport() error=%v", err)
+		}
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("proxy starts=%d want 1", got)
+	}
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	for _, peer := range peers {
+		_ = peer.Close()
 	}
 }
