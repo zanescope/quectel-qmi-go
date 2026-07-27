@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,7 @@ var (
 	dialProxyHook         = dialProxy
 	startProxyProcessHook = startProxyProcess
 	proxyRetryDelay       = 100 * time.Millisecond
+	proxyStartMu          sync.Mutex
 )
 
 func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, error) {
@@ -34,6 +36,15 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 	}
 
 	conn, firstErr := dialProxyHook(ctx, proxyPath)
+	if firstErr == nil {
+		return conn, nil
+	}
+
+	proxyStartMu.Lock()
+	defer proxyStartMu.Unlock()
+
+	// Another caller may have started the shared proxy while this caller waited.
+	conn, firstErr = dialProxyHook(ctx, proxyPath)
 	if firstErr == nil {
 		return conn, nil
 	}

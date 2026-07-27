@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,5 +266,65 @@ func TestEnsureDataPlaneServicesAllocatesLazyServices(t *testing.T) {
 	}
 	if rawIPCalls != 1 {
 		t.Fatalf("RawIP calls=%d want 1", rawIPCalls)
+	}
+}
+
+func TestEnsureDataPlaneServicesSerializesConcurrentAllocation(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:          ModemDevice{NetInterface: "wwan0"},
+		EnableIPv4:      true,
+		DataPlanePolicy: DataPlanePolicyLazy,
+	}
+	m.client = &qmi.Client{}
+
+	var wdsCalls atomic.Int32
+	var wdaCalls atomic.Int32
+	var rawIPCalls atomic.Int32
+	firstAllocationStarted := make(chan struct{})
+	releaseFirstAllocation := make(chan struct{})
+	var signalFirst sync.Once
+
+	m.newWDSService = func(context.Context, *qmi.Client) (*qmi.WDSService, error) {
+		wdsCalls.Add(1)
+		signalFirst.Do(func() { close(firstAllocationStarted) })
+		<-releaseFirstAllocation
+		return &qmi.WDSService{}, nil
+	}
+	m.newWDAService = func(context.Context, *qmi.Client) (*qmi.WDAService, error) {
+		wdaCalls.Add(1)
+		return &qmi.WDAService{}, nil
+	}
+	m.enableRawIPHook = func(context.Context) error {
+		rawIPCalls.Add(1)
+		return nil
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- m.ensureDataPlaneServices(context.Background()) }()
+	<-firstAllocationStarted
+
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		errCh <- m.ensureDataPlaneServices(context.Background())
+	}()
+	<-secondStarted
+	time.Sleep(20 * time.Millisecond)
+	close(releaseFirstAllocation)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("ensureDataPlaneServices() error = %v", err)
+		}
+	}
+	if got := wdsCalls.Load(); got != 1 {
+		t.Fatalf("WDS allocations=%d want 1", got)
+	}
+	if got := wdaCalls.Load(); got != 1 {
+		t.Fatalf("WDA allocations=%d want 1", got)
+	}
+	if got := rawIPCalls.Load(); got != 1 {
+		t.Fatalf("RawIP calls=%d want 1", got)
 	}
 }

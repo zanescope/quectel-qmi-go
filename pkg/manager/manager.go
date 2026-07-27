@@ -174,6 +174,8 @@ type Manager struct {
 
 	// State
 	mu                sync.RWMutex
+	connectMu         sync.Mutex
+	dataPlaneMu       sync.Mutex
 	state             State
 	settings          *qmi.RuntimeSettings
 	controlReady      bool
@@ -1220,6 +1222,9 @@ func (m *Manager) dataPlaneDisabled() bool {
 }
 
 func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
+	m.dataPlaneMu.Lock()
+	defer m.dataPlaneMu.Unlock()
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1227,16 +1232,16 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		return ErrServiceNotReady("data-plane")
 	}
 
-	var err error
 	if m.cfg.EnableIPv4 && m.wds == nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		m.log.Debug("Allocating WDS client for IPv4...")
-		m.wds, err = m.createWDSService(ctx)
+		wds, err := m.createWDSService(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to allocate WDS client: %w", err)
 		}
+		m.wds = wds
 		m.log.Debug("Allocated WDS client for IPv4")
 	}
 
@@ -1245,10 +1250,11 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 			return err
 		}
 		m.log.Debug("Allocating WDS client for IPv6...")
-		m.wdsV6, err = m.createWDSService(ctx)
+		wdsV6, err := m.createWDSService(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to allocate IPv6 WDS client: %w", err)
 		}
+		m.wdsV6 = wdsV6
 		m.log.Debug("Allocated WDS client for IPv6")
 	}
 
@@ -1257,10 +1263,11 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 			return err
 		}
 		m.log.Debug("Allocating WDA client...")
-		m.wda, err = m.createWDAService(ctx)
+		wda, err := m.createWDAService(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to allocate WDA client: %w", err)
 		}
+		m.wda = wda
 		m.log.Debug("Allocated WDA client")
 
 		if err := m.enableRawIP(ctx); err != nil {
@@ -2582,7 +2589,8 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
 		return m.enableRawIPHook(parent)
 	}
-	if m.wda == nil {
+	wda := m.wda
+	if wda == nil {
 		return fmt.Errorf("WDA service not available")
 	}
 
@@ -2619,7 +2627,7 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	modemEnabled := false
 	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
 	defer cancel()
-	if currentFormat, err := m.wda.GetDataFormat(ctx); err == nil {
+	if currentFormat, err := wda.GetDataFormat(ctx); err == nil {
 		if currentFormat.LinkProtocol == qmi.LinkProtocolIP {
 			modemEnabled = true
 		}
@@ -2641,7 +2649,7 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	}
 	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
 	defer cancel()
-	if err := m.wda.SetDataFormat(ctx, format); err != nil {
+	if err := wda.SetDataFormat(ctx, format); err != nil {
 		m.log.WithError(err).Warn("Failed to set modem data format to Raw IP (might already be set or not supported), continuing to force kernel...")
 	} else {
 		m.log.Info("Modem data format set to Raw IP")
@@ -3130,7 +3138,7 @@ func (m *Manager) doRecoverCore(request recoveryRequest) bool {
 		openErr = m.openClientAndAllocateServices(context.Background())
 	}
 	if openErr != nil {
-		m.log.WithError(openErr).Warn("Failed to reinitialize QMI after modem reset")
+		m.log.WithError(openErr).Warn("Failed to reinitialize QMI core during recovery")
 		m.mu.Lock()
 		m.markControlNotReadyLocked("recover_reinit_services")
 		m.markCoreNotReadyLocked("recover_reinit_services", openErr)
@@ -3390,6 +3398,9 @@ func jitteredFullCheckInterval(base time.Duration) time.Duration {
 }
 
 func (m *Manager) doConnect() error {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
 	m.mu.Lock()
 	if !m.desiredConnection {
 		m.mu.Unlock()

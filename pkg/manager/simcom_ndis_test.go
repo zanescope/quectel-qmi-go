@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,5 +140,58 @@ func TestSIMCOMNDISConnectRequiresATPort(t *testing.T) {
 
 	if err := m.doConnect(); err == nil {
 		t.Fatal("doConnect() error = nil, want missing AT port error")
+	}
+}
+
+func TestDoConnectSerializesConcurrentCalls(t *testing.T) {
+	fakeNet := &fakeSIMCOMConfigurator{}
+	netcfg.SetConfigurator(fakeNet)
+	t.Cleanup(func() { netcfg.SetConfigurator(nil) })
+
+	m := New(Config{
+		Device: ModemDevice{
+			VendorID:     VendorSIMCOM,
+			NetInterface: "wwan0",
+			ATPort:       "/dev/ttyUSB2",
+		},
+		APN:        "cmnet",
+		EnableIPv4: true,
+	}, nil)
+	m.desiredConnection = true
+
+	var commandCalls atomic.Int32
+	firstCommandStarted := make(chan struct{})
+	releaseCommands := make(chan struct{})
+	var signalFirst sync.Once
+	m.simcomATCommand = func(context.Context, string, string, time.Duration) (string, error) {
+		commandCalls.Add(1)
+		signalFirst.Do(func() { close(firstCommandStarted) })
+		<-releaseCommands
+		return "\r\nOK\r\n", nil
+	}
+	m.simcomDHCP = func(context.Context, string) error {
+		fakeNet.ip = net.IPv4(10, 64, 1, 2)
+		return nil
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- m.doConnect() }()
+	<-firstCommandStarted
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		errCh <- m.doConnect()
+	}()
+	<-secondStarted
+	time.Sleep(20 * time.Millisecond)
+	close(releaseCommands)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("doConnect() error = %v", err)
+		}
+	}
+	if got := commandCalls.Load(); got != 2 {
+		t.Fatalf("AT command calls=%d want 2 from one serialized connection", got)
 	}
 }
