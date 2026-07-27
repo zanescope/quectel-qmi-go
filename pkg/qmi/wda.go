@@ -91,6 +91,10 @@ type LoopbackConfig struct {
 
 // SetDataFormat sets the data format (e.g. Raw IP) / SetDataFormat设置数据格式 (例如 原始IP)
 func (s *WDAService) SetDataFormat(ctx context.Context, format DataFormat) error {
+	if s == nil {
+		return fmt.Errorf("WDA service not available")
+	}
+
 	var endpointTLV *TLV
 	if current, err := s.GetDataFormatDetails(ctx); err == nil {
 		if current.EndpointType != 0 && current.EndpointID != 0 {
