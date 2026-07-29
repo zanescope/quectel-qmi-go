@@ -67,7 +67,16 @@ type ClientLogFunc func(level ClientLogLevel, format string, args ...any)
 
 // ClientOptions controls runtime behavior for the low-level QMI client.
 type ClientOptions struct {
-	SyncOnOpen            bool
+	// SyncOnOpen requests an initial CTL SYNC when the final transport is raw.
+	// The zero value keeps the historical default (enabled), so callers that
+	// need to opt out reliably should set DisableSyncOnOpen.
+	//
+	// CTL SYNC is never sent through qmi-proxy because it releases client IDs
+	// that may belong to other proxy users.
+	SyncOnOpen bool
+	// DisableSyncOnOpen explicitly disables the initial CTL SYNC on raw QMI.
+	// It takes precedence over SyncOnOpen.
+	DisableSyncOnOpen     bool
 	QueryVersionOnOpen    bool // 启动时自动查询服务版本信息
 	ReadDeadline          time.Duration
 	DefaultRequestTimeout time.Duration
@@ -214,6 +223,9 @@ func normalizeClientOptions(opts ClientOptions) ClientOptions {
 		opts.IndicationQueueSize == defaults.IndicationQueueSize {
 		opts.SyncOnOpen = defaults.SyncOnOpen
 	}
+	if opts.DisableSyncOnOpen {
+		opts.SyncOnOpen = false
+	}
 	if !opts.QueryVersionOnOpen &&
 		opts.ReadDeadline == defaults.ReadDeadline &&
 		opts.DefaultRequestTimeout == defaults.DefaultRequestTimeout &&
@@ -296,7 +308,9 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 	}
 
 	// Initial sync (non-fatal, helps clear modem state) / 初始同步 (非致命，有助于清除modem状态)
-	if opts.SyncOnOpen {
+	// CTL SYNC releases existing client IDs, including IDs owned by other
+	// qmi-proxy users, so shared proxy sessions must never send it.
+	if c.opts.SyncOnOpen && !c.opts.DisableSyncOnOpen && !c.opts.UseProxy {
 		syncCtx := ctx
 		if syncCtx == nil {
 			syncCtx = context.Background()
