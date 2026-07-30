@@ -255,10 +255,11 @@ func logClientOption(opts ClientOptions, level ClientLogLevel, format string, ar
 // NewClientWithOptions creates a new QMI client connected to the given device path.
 func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) (*Client, error) {
 	opts = normalizeClientOptions(opts)
-	openCtx := ctx
-	if openCtx == nil {
-		openCtx = context.Background()
+	callerCtx := ctx
+	if callerCtx == nil {
+		callerCtx = context.Background()
 	}
+	openCtx := callerCtx
 	if _, hasDeadline := openCtx.Deadline(); !hasDeadline && opts.UseProxy && opts.ProxyOpenTimeout > 0 {
 		var cancel context.CancelFunc
 		openCtx, cancel = context.WithTimeout(openCtx, opts.ProxyOpenTimeout)
@@ -271,10 +272,22 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 	)
 	if opts.UseProxy {
 		conn, err = openProxyTransportHook(openCtx, opts)
+		if err != nil && callerCtx.Err() != nil {
+			return nil, callerCtx.Err()
+		}
 		if err != nil && opts.ProxyFallbackToRaw {
 			logClientOption(opts, ClientLogLevelWarn, "QMI: qmi-proxy transport unavailable, falling back to raw QMI for %s: %v", path, err)
 			opts.UseProxy = false
+			if callerErr := callerCtx.Err(); callerErr != nil {
+				return nil, callerErr
+			}
 			conn, err = openRawTransportHook(path)
+			if err == nil {
+				if callerErr := callerCtx.Err(); callerErr != nil {
+					_ = conn.Close()
+					return nil, callerErr
+				}
+			}
 			if err != nil {
 				return nil, fmt.Errorf("qmi-proxy unavailable and raw QMI fallback failed for %s: %w", path, err)
 			}
@@ -290,18 +303,27 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 
 	if opts.UseProxy {
 		if err := c.openProxyDevice(openCtx, path); err != nil {
+			_ = c.Close()
+			if callerCtx.Err() != nil {
+				return nil, callerCtx.Err()
+			}
 			if opts.ProxyFallbackToRaw {
-				_ = c.Close()
 				logClientOption(opts, ClientLogLevelWarn, "QMI: qmi-proxy failed to open device %s, falling back to raw QMI: %v", path, err)
 				fallbackOpts := opts
 				fallbackOpts.UseProxy = false
+				if callerErr := callerCtx.Err(); callerErr != nil {
+					return nil, callerErr
+				}
 				conn, rawErr := openRawTransportHook(path)
 				if rawErr != nil {
 					return nil, fmt.Errorf("qmi-proxy device open failed for %s: %v; raw QMI fallback failed: %w", path, err, rawErr)
 				}
+				if callerErr := callerCtx.Err(); callerErr != nil {
+					_ = conn.Close()
+					return nil, callerErr
+				}
 				c = newClientWithTransport(path, fallbackOpts, conn)
 			} else {
-				_ = c.Close()
 				return nil, err
 			}
 		}
