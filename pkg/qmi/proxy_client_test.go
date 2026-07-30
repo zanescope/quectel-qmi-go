@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -246,6 +247,246 @@ func TestClientFallsBackToRawWhenProxyTransportOpenFails(t *testing.T) {
 	}
 	if client.opts.UseProxy {
 		t.Fatal("client.opts.UseProxy=true after fallback, want false")
+	}
+}
+
+func TestClientDoesNotFallbackToRawAfterCallerCancellation(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-canceled-fallback"
+
+	proxyEntered := make(chan struct{})
+	releaseProxy := make(chan struct{})
+	restoreProxy := replaceProxyTransportForTest(t, func(context.Context, ClientOptions) (qmiTransport, error) {
+		close(proxyEntered)
+		<-releaseProxy
+		return nil, errors.New("proxy unavailable")
+	})
+	defer restoreProxy()
+
+	rawAttempts := 0
+	restoreRaw := replaceRawTransportForTest(t, func(string) (qmiTransport, error) {
+		rawAttempts++
+		return nil, errors.New("raw fallback must not run")
+	})
+	defer restoreRaw()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type openResult struct {
+		client *Client
+		err    error
+	}
+	result := make(chan openResult, 1)
+	go func() {
+		client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+			UseProxy:           true,
+			ProxyFallbackToRaw: true,
+			DisableSyncOnOpen:  true,
+		})
+		result <- openResult{client: client, err: err}
+	}()
+
+	<-proxyEntered
+	cancel()
+	close(releaseProxy)
+
+	select {
+	case got := <-result:
+		if got.client != nil {
+			_ = got.client.Close()
+			t.Fatal("NewClientWithOptions() returned a client after caller cancellation")
+		}
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("NewClientWithOptions() error=%v, want context canceled", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NewClientWithOptions() did not return after caller cancellation")
+	}
+	if rawAttempts != 0 {
+		t.Fatalf("raw attempts=%d, want 0", rawAttempts)
+	}
+}
+
+func TestClientDoesNotFallbackToRawWhenFallbackLogCancelsCaller(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-log-canceled-fallback"
+
+	tests := []struct {
+		name                   string
+		failProxyTransportOpen bool
+	}{
+		{name: "proxy transport open", failProxyTransportOpen: true},
+		{name: "proxy device open"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			restoreProxy := replaceProxyTransportForTest(t, func(context.Context, ClientOptions) (qmiTransport, error) {
+				if tt.failProxyTransportOpen {
+					return nil, errors.New("proxy transport unavailable")
+				}
+				clientConn, serverConn := net.Pipe()
+				_ = serverConn.Close()
+				return clientConn, nil
+			})
+			defer restoreProxy()
+
+			rawAttempts := 0
+			restoreRaw := replaceRawTransportForTest(t, func(string) (qmiTransport, error) {
+				rawAttempts++
+				return nil, errors.New("raw fallback must not run")
+			})
+			defer restoreRaw()
+
+			fallbackLogged := false
+			client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+				UseProxy:           true,
+				ProxyFallbackToRaw: true,
+				DisableSyncOnOpen:  true,
+				Logf: func(_ ClientLogLevel, format string, _ ...any) {
+					if strings.Contains(format, "falling back to raw QMI") {
+						fallbackLogged = true
+						cancel()
+					}
+				},
+			})
+			if client != nil {
+				_ = client.Close()
+				t.Fatal("NewClientWithOptions() returned a client after fallback logging canceled the caller")
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("NewClientWithOptions() error=%v, want context canceled", err)
+			}
+			if !fallbackLogged {
+				t.Fatal("fallback warning was not logged")
+			}
+			if rawAttempts != 0 {
+				t.Fatalf("raw attempts=%d, want 0", rawAttempts)
+			}
+		})
+	}
+}
+
+func TestClientClosesRawFallbackWhenCallerCanceledDuringOpen(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-raw-open-canceled-fallback"
+
+	tests := []struct {
+		name                   string
+		failProxyTransportOpen bool
+	}{
+		{name: "proxy transport open", failProxyTransportOpen: true},
+		{name: "proxy device open"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			restoreProxy := replaceProxyTransportForTest(t, func(context.Context, ClientOptions) (qmiTransport, error) {
+				if tt.failProxyTransportOpen {
+					return nil, errors.New("proxy transport unavailable")
+				}
+				clientConn, serverConn := net.Pipe()
+				_ = serverConn.Close()
+				return clientConn, nil
+			})
+			defer restoreProxy()
+
+			rawAttempts := 0
+			var rawPeer net.Conn
+			restoreRaw := replaceRawTransportForTest(t, func(path string) (qmiTransport, error) {
+				rawAttempts++
+				if path != devicePath {
+					t.Fatalf("raw path=%q, want %q", path, devicePath)
+				}
+				clientConn, serverConn := net.Pipe()
+				if err := serverConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				rawPeer = serverConn
+				t.Cleanup(func() {
+					_ = serverConn.Close()
+				})
+				cancel()
+				return clientConn, nil
+			})
+			defer restoreRaw()
+
+			client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+				UseProxy:           true,
+				ProxyFallbackToRaw: true,
+				DisableSyncOnOpen:  true,
+				Logf:               func(ClientLogLevel, string, ...any) {},
+			})
+			if client != nil {
+				defer client.Close()
+				t.Error("NewClientWithOptions() returned a client after cancellation during raw open")
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("NewClientWithOptions() error=%v, want context canceled", err)
+			}
+			if rawAttempts != 1 {
+				t.Fatalf("raw attempts=%d, want 1", rawAttempts)
+			}
+			if rawPeer == nil {
+				t.Fatal("raw fallback did not return a peer connection")
+			}
+			var buf [1]byte
+			if _, readErr := rawPeer.Read(buf[:]); !errors.Is(readErr, io.EOF) {
+				t.Fatalf("raw fallback peer read error=%v, want EOF after canceled transport was closed", readErr)
+			}
+		})
+	}
+}
+
+func TestClientFallsBackToRawAfterInternalProxyTimeout(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-internal-timeout-fallback"
+
+	proxyEntered := make(chan struct{})
+	restoreProxy := replaceProxyTransportForTest(t, func(ctx context.Context, _ ClientOptions) (qmiTransport, error) {
+		close(proxyEntered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	defer restoreProxy()
+
+	rawAttempts := 0
+	restoreRaw := replaceRawTransportForTest(t, func(path string) (qmiTransport, error) {
+		rawAttempts++
+		if path != devicePath {
+			t.Fatalf("raw path=%q, want %q", path, devicePath)
+		}
+		clientConn, serverConn := net.Pipe()
+		t.Cleanup(func() {
+			_ = serverConn.Close()
+		})
+		return clientConn, nil
+	})
+	defer restoreRaw()
+
+	callerCtx := context.Background()
+	client, err := NewClientWithOptions(callerCtx, devicePath, ClientOptions{
+		UseProxy:           true,
+		ProxyOpenTimeout:   10 * time.Millisecond,
+		ProxyFallbackToRaw: true,
+		DisableSyncOnOpen:  true,
+		ReadDeadline:       5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions() error=%v", err)
+	}
+	defer client.Close()
+
+	<-proxyEntered
+	if err := callerCtx.Err(); err != nil {
+		t.Fatalf("caller context error=%v, want nil", err)
+	}
+	if rawAttempts != 1 {
+		t.Fatalf("raw attempts=%d, want 1", rawAttempts)
+	}
+	if client.opts.UseProxy {
+		t.Fatal("client.opts.UseProxy=true after internal timeout fallback, want false")
 	}
 }
 

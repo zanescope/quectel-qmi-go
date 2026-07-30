@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -19,7 +18,11 @@ var (
 	dialProxyHook         = dialProxy
 	startProxyProcessHook = startProxyProcess
 	proxyRetryDelay       = 100 * time.Millisecond
-	proxyStartMu          sync.Mutex
+	proxyStartGate        = func() chan struct{} {
+		gate := make(chan struct{}, 1)
+		gate <- struct{}{}
+		return gate
+	}()
 )
 
 func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, error) {
@@ -40,13 +43,18 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 		return conn, nil
 	}
 
-	proxyStartMu.Lock()
-	defer proxyStartMu.Unlock()
+	if err := acquireProxyStartGate(ctx); err != nil {
+		return nil, fmt.Errorf("wait to start qmi-proxy %q: %w", proxyPath, err)
+	}
+	defer releaseProxyStartGate()
 
 	// Another caller may have started the shared proxy while this caller waited.
 	conn, firstErr = dialProxyHook(ctx, proxyPath)
 	if firstErr == nil {
 		return conn, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connect qmi-proxy %q after acquiring startup gate: %w", proxyPath, err)
 	}
 
 	if proxyExecutable == "" {
@@ -54,6 +62,9 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 	}
 	if _, err := os.Stat(proxyExecutable); err != nil {
 		return nil, fmt.Errorf("connect qmi-proxy %q failed: %w; proxy executable %s is unavailable: %v", proxyPath, firstErr, proxyExecutable, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connect qmi-proxy %q before starting %s: %w", proxyPath, proxyExecutable, err)
 	}
 	if err := startProxyProcessHook(proxyExecutable); err != nil {
 		return nil, fmt.Errorf("connect qmi-proxy %q failed and start %s failed: %w", proxyPath, proxyExecutable, err)
@@ -82,6 +93,28 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 		}
 		lastErr = err
 	}
+}
+
+func acquireProxyStartGate(ctx context.Context) error {
+	// Prefer an already-observed cancellation over a simultaneously available
+	// gate token so a canceled caller never begins proxy startup work.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-proxyStartGate:
+		if err := ctx.Err(); err != nil {
+			releaseProxyStartGate()
+			return err
+		}
+		return nil
+	}
+}
+
+func releaseProxyStartGate() {
+	proxyStartGate <- struct{}{}
 }
 
 func dialProxy(ctx context.Context, proxyPath string) (qmiTransport, error) {

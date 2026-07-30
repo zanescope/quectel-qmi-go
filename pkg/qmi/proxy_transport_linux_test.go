@@ -135,6 +135,138 @@ func TestOpenProxyTransportRetriesUntilProxyIsReady(t *testing.T) {
 	}
 }
 
+type cancelBetweenGateChecksContext struct {
+	context.Context
+	checks atomic.Int32
+}
+
+func (c *cancelBetweenGateChecksContext) Done() <-chan struct{} {
+	return nil
+}
+
+func (c *cancelBetweenGateChecksContext) Err() error {
+	if c.checks.Add(1) == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+func TestAcquireProxyStartGateReturnsTokenWhenCancellationWinsAfterReceipt(t *testing.T) {
+	ctx := &cancelBetweenGateChecksContext{Context: context.Background()}
+	if err := acquireProxyStartGate(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("acquireProxyStartGate() error=%v, want context canceled", err)
+	}
+
+	select {
+	case <-proxyStartGate:
+		releaseProxyStartGate()
+	default:
+		t.Fatal("proxy start gate token was not returned after cancellation")
+	}
+}
+
+func TestOpenProxyTransportGateWaitIsCancelable(t *testing.T) {
+	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
+	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDial := dialProxyHook
+	oldStart := startProxyProcessHook
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		startProxyProcessHook = oldStart
+	})
+
+	select {
+	case <-proxyStartGate:
+		t.Cleanup(releaseProxyStartGate)
+	default:
+		t.Fatal("proxy start gate is unexpectedly held")
+	}
+
+	firstDialDone := make(chan struct{})
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		select {
+		case <-firstDialDone:
+		default:
+			close(firstDialDone)
+		}
+		return nil, errors.New("proxy socket not ready")
+	}
+	startProxyProcessHook = func(string) error {
+		t.Error("startProxyProcessHook called while gate was held")
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := openProxyTransport(ctx, ClientOptions{
+			ProxyPath:       "@qmi-proxy",
+			ProxyExecutable: proxyExecutable,
+		})
+		result <- err
+	}()
+
+	<-firstDialDone
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("openProxyTransport() error=%v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("openProxyTransport() did not return while the gate remained held")
+	}
+}
+
+func TestOpenProxyTransportDoesNotStartProxyAfterSecondDialCancels(t *testing.T) {
+	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
+	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDial := dialProxyHook
+	oldStart := startProxyProcessHook
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		startProxyProcessHook = oldStart
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dialAttempts := 0
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		dialAttempts++
+		if dialAttempts == 2 {
+			cancel()
+		}
+		return nil, errors.New("proxy socket not ready")
+	}
+	startAttempts := 0
+	startProxyProcessHook = func(string) error {
+		startAttempts++
+		return nil
+	}
+
+	_, err := openProxyTransport(ctx, ClientOptions{
+		ProxyPath:       "@qmi-proxy",
+		ProxyExecutable: proxyExecutable,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("openProxyTransport() error=%v, want context canceled", err)
+	}
+	if dialAttempts != 2 {
+		t.Fatalf("dial attempts=%d, want 2", dialAttempts)
+	}
+	if startAttempts != 0 {
+		t.Fatalf("proxy start attempts=%d, want 0 after caller cancellation", startAttempts)
+	}
+}
+
 func TestOpenProxyTransportStartsSharedProxyOnce(t *testing.T) {
 	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
 	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -150,12 +282,15 @@ func TestOpenProxyTransportStartsSharedProxyOnce(t *testing.T) {
 		proxyRetryDelay = oldRetryDelay
 	})
 
+	const callers = 8
 	var ready atomic.Bool
 	var starts atomic.Int32
 	var peersMu sync.Mutex
 	var peers []net.Conn
+	notReadyDialed := make(chan struct{}, callers+1)
 	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
 		if !ready.Load() {
+			notReadyDialed <- struct{}{}
 			return nil, errors.New("proxy socket not ready")
 		}
 		client, server := net.Pipe()
@@ -177,7 +312,6 @@ func TestOpenProxyTransportStartsSharedProxyOnce(t *testing.T) {
 	}
 	proxyRetryDelay = time.Millisecond
 
-	const callers = 8
 	errCh := make(chan error, callers)
 	for i := 0; i < callers; i++ {
 		go func() {
@@ -195,7 +329,9 @@ func TestOpenProxyTransportStartsSharedProxyOnce(t *testing.T) {
 	}
 
 	<-startEntered
-	time.Sleep(20 * time.Millisecond)
+	for i := 0; i < callers+1; i++ {
+		<-notReadyDialed
+	}
 	close(releaseStart)
 	for i := 0; i < callers; i++ {
 		if err := <-errCh; err != nil {
