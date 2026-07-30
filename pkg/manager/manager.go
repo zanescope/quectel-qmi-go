@@ -176,6 +176,7 @@ type Manager struct {
 	mu                sync.RWMutex
 	connectMu         sync.Mutex
 	dataPlaneMu       sync.Mutex
+	rawIPConfigured   atomic.Bool
 	state             State
 	settings          *qmi.RuntimeSettings
 	controlReady      bool
@@ -1258,25 +1259,28 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		m.log.Debug("Allocated WDS client for IPv6")
 	}
 
-	if m.shouldAllocateWDA() && m.wda == nil {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		m.log.Debug("Allocating WDA client...")
-		wda, err := m.createWDAService(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to allocate WDA client: %w", err)
-		}
-		m.wda = wda
-		m.log.Debug("Allocated WDA client")
-
-		if err := m.enableRawIP(ctx); err != nil {
-			if ctx.Err() != nil {
-				return fmt.Errorf("failed to enable RawIP mode: %w", ctx.Err())
+	if m.shouldAllocateWDA() {
+		if m.wda == nil {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			m.log.WithError(err).Warn("Failed to enable RawIP mode, falling back to 802.3")
+			m.log.Debug("Allocating WDA client...")
+			wda, err := m.createWDAService(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to allocate WDA client: %w", err)
+			}
+			m.wda = wda
+			m.rawIPConfigured.Store(false)
+			m.log.Debug("Allocated WDA client")
 		}
-	} else if !m.shouldAllocateWDA() {
+
+		if !m.rawIPConfigured.Load() {
+			if err := m.enableRawIP(ctx); err != nil {
+				return fmt.Errorf("failed to enable RawIP mode: %w", err)
+			}
+			m.rawIPConfigured.Store(true)
+		}
+	} else {
 		m.log.Debug("Skipping WDA client allocation")
 	}
 
@@ -2584,6 +2588,45 @@ func (m *Manager) voiceIndicationRegistration() (qmi.VoiceIndicationRegistration
 	}, true
 }
 
+type rawIPKernelOps struct {
+	readFile  func(string) ([]byte, error)
+	writeFile func(string, []byte, os.FileMode) error
+	bringDown func(string) error
+}
+
+func rawIPStateEnabled(content []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(string(content)), "Y")
+}
+
+func ensureKernelRawIP(ifname, sysfsPath string, ops rawIPKernelOps) (bool, error) {
+	content, err := ops.readFile(sysfsPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("read raw_ip state for interface %s: %w", ifname, err)
+	}
+	if rawIPStateEnabled(content) {
+		return true, nil
+	}
+
+	if err := ops.bringDown(ifname); err != nil {
+		return true, fmt.Errorf("bring interface %s down before enabling raw_ip: %w", ifname, err)
+	}
+	if err := ops.writeFile(sysfsPath, []byte("Y"), 0o644); err != nil {
+		return true, fmt.Errorf("write raw_ip=Y for interface %s after link down: %w", ifname, err)
+	}
+
+	content, err = ops.readFile(sysfsPath)
+	if err != nil {
+		return true, fmt.Errorf("read back raw_ip state for interface %s: %w", ifname, err)
+	}
+	if !rawIPStateEnabled(content) {
+		return true, fmt.Errorf("verify raw_ip for interface %s: got %q, want %q", ifname, strings.TrimSpace(string(content)), "Y")
+	}
+	return true, nil
+}
+
 // enableRawIP enables RawIP mode on both the modem (WDA) and the kernel interface / 启用RawIP模式：同时在Modem(WDA)和内核接口上启用
 func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
@@ -2593,93 +2636,54 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	if wda == nil {
 		return fmt.Errorf("WDA service not available")
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
 
-	// 1. Kernel Check (Linux Only) / 1. 内核检查 (仅限Linux)
-	// On Windows/Darwin, we don't have sysfs qmi/raw_ip, so we might skip kernel part / 在Windows/Darwin上，没有sysfs qmi/raw_ip，所以跳过内核部分
-	// or assume the driver handles it differently. / 或者假设驱动程序以不同方式处理。
-	isLinux := runtime.GOOS == "linux"
 	ifname := m.cfg.Device.NetInterface
-	sysfsPath := filepath.Join("/sys/class/net", ifname, "qmi/raw_ip")
-	kernelEnabled := false
-
-	if isLinux {
-		// Check if raw_ip sysfs attribute exists / 检查 raw_ip sysfs 属性是否存在
-		if _, err := os.Stat(sysfsPath); os.IsNotExist(err) {
-			// Not supported by kernel driver, skip / 内核驱动不支持，跳过
+	if runtime.GOOS == "linux" {
+		sysfsPath := filepath.Join("/sys/class/net", ifname, "qmi/raw_ip")
+		supported, err := ensureKernelRawIP(ifname, sysfsPath, rawIPKernelOps{
+			readFile:  os.ReadFile,
+			writeFile: os.WriteFile,
+			bringDown: netcfg.BringDown,
+		})
+		if err != nil {
+			return fmt.Errorf("configure kernel raw_ip: %w", err)
+		}
+		if !supported {
 			m.log.Warn("Kernel driver does not support raw_ip (sysfs entry missing), skipping kernel config")
 		} else {
-			// Optimization: Check if already enabled in Kernel / 优化：检查内核中是否已启用
-			if content, err := os.ReadFile(sysfsPath); err == nil {
-				s := string(content)
-				if len(s) > 0 && (s[0] == 'Y' || s[0] == 'y' || s[0] == '1') {
-					kernelEnabled = true
-				}
-			}
+			m.log.Info("Kernel raw_ip is enabled and verified")
 		}
-	} else {
-		// Non-Linux platforms: Assume kernel/driver doesn't need manual raw_ip toggle via sysfs / 非Linux平台：假设内核/驱动不需要通过sysfs手动切换raw_ip
-		// or it's always enabled/handled by driver. / 或者它总是由驱动程序启用/处理。
-		// We still proceed to configure the Modem, as that's platform independent QMI. / 我们仍然继续配置Modem，因为那是与平台无关的QMI。
-		kernelEnabled = true // Treat as "done" for the purpose of the combined check / 将其视为“已完成”以进行组合检查
 	}
 
-	// Optimization: Check if already enabled in Modem (if WDA available) / 优化：检查Modem中是否已启用 (如果WDA可用)
-	modemEnabled := false
-	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	if currentFormat, err := wda.GetDataFormat(ctx); err == nil {
+	statusCtx, statusCancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
+	defer statusCancel()
+	if currentFormat, err := wda.GetDataFormat(statusCtx); err == nil {
 		if currentFormat.LinkProtocol == qmi.LinkProtocolIP {
-			modemEnabled = true
+			m.log.Info("Modem Raw IP mode already enabled")
+			return nil
 		}
 	} else {
-		m.log.WithError(err).Debug("Failed to get current data format, assuming mismatch")
+		m.log.WithError(err).Debug("Failed to get current data format, configuring Raw IP")
 	}
 
-	if kernelEnabled && modemEnabled {
-		m.log.Info("Raw IP mode already enabled, skipping configuration")
-		return nil
-	}
-
-	// 2. Set Modem Data Format to Raw IP / 2. 将Modem数据格式设置为Raw IP
 	m.log.Info("Setting modem data format to Raw IP...")
 	format := qmi.DataFormat{
-		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
+		LinkProtocol:      qmi.LinkProtocolIP,
 		UlDataAggregation: uint32(qmi.DataFormatUlDataAggDisabled),
 		DlDataAggregation: uint32(qmi.DataFormatDlDataAggDisabled),
 	}
-	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	if err := wda.SetDataFormat(ctx, format); err != nil {
-		m.log.WithError(err).Warn("Failed to set modem data format to Raw IP (might already be set or not supported), continuing to force kernel...")
-	} else {
-		m.log.Info("Modem data format set to Raw IP")
+	setCtx, setCancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
+	defer setCancel()
+	if err := wda.SetDataFormat(setCtx, format); err != nil {
+		return fmt.Errorf("set modem data format to Raw IP: %w", err)
 	}
-
-	// 3. Enable Raw IP in kernel (Linux Only) / 3. 在内核中启用Raw IP (仅限Linux)
-	if isLinux && !kernelEnabled {
-		// Check again if file exists before writing / 在写入之前再次检查文件是否存在
-		if _, err := os.Stat(sysfsPath); os.IsNotExist(err) {
-			return nil // Skip if not supported / 如果不支持则跳过
-		}
-
-		m.log.Info("Enabling Raw IP in kernel...")
-
-		// Ensure interface is down before changing mode (sometimes required) / 确保在更改模式之前接口已关闭 (有时是必需的)
-		if err := netcfg.BringDown(ifname); err != nil {
-			m.log.WithError(err).Warn("Failed to bring down interface for Raw IP switch")
-		}
-
-		if err := os.WriteFile(sysfsPath, []byte("Y"), 0644); err != nil {
-			// Try 'Y' with newline just in case / 尝试带换行符的 'Y' 以防万一
-			if err2 := os.WriteFile(sysfsPath, []byte("Y\n"), 0644); err2 != nil {
-				return fmt.Errorf("failed to write to raw_ip sysfs: %w", err)
-			}
-		}
-
-		// Bring interface back up? configureNetwork will do it later. / 重新启动接口？ configureNetwork稍后会做。
-		m.log.Info("Raw IP mode enabled successfully in kernel")
-	}
-
+	m.log.Info("Modem data format set to Raw IP")
 	return nil
 }
 
@@ -2763,6 +2767,7 @@ func (m *Manager) cleanup() {
 	m.dms = nil
 	m.uim = nil
 	m.wda = nil
+	m.rawIPConfigured.Store(false)
 	m.wms = nil
 	m.ims = nil
 	m.imsa = nil
@@ -3041,17 +3046,6 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if runtime.GOOS == "linux" {
-		rawIPPath := filepath.Join("/sys/class/net", m.cfg.Device.NetInterface, "qmi/raw_ip")
-		if b, err := os.ReadFile(rawIPPath); err == nil && len(b) > 0 {
-			if b[0] != 'Y' && b[0] != 'y' && b[0] != '1' {
-				if err := os.WriteFile(rawIPPath, []byte("Y"), 0); err != nil {
-					m.log.WithError(err).Warn("Failed to enable kernel raw_ip")
-				}
-			}
-		}
-	}
-
 	const maxAttempts = 4
 	var lastErr error
 
@@ -3442,12 +3436,7 @@ func (m *Manager) doConnect() error {
 		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
 			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
 
-		// 1. 确保 Raw IP 模式已开启
-		if err := netcfg.EnableRawIP(masterIface); err != nil {
-			m.log.WithError(err).Warn("开启 Raw IP 模式失败")
-		}
-
-		// 2. 创建 QMAP 虚拟网卡 (如果不存在)
+		// 1. 创建 QMAP 虚拟网卡 (如果不存在)
 		muxIfname, err := netcfg.AddQMAPMux(masterIface, m.cfg.MuxID)
 		if err != nil {
 			m.log.WithError(err).Errorf("创建 MUX ID=%d 虚拟网卡失败", m.cfg.MuxID)
@@ -3459,7 +3448,7 @@ func (m *Manager) doConnect() error {
 			m.mu.Unlock()
 		}
 
-		// 3. 绑定 WDS Client 到 Mux Data Port
+		// 2. 绑定 WDS Client 到 Mux Data Port
 		binding := qmi.MuxBinding{
 			EpType:     0x02, // HSUSB
 			EpIfID:     0x04, // 默认 Interface ID
