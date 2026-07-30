@@ -5,6 +5,55 @@ import (
 	"fmt"
 )
 
+// TransportOperation identifies the failed QMI transport direction.
+type TransportOperation string
+
+const (
+	TransportOperationRead  TransportOperation = "read"
+	TransportOperationWrite TransportOperation = "write"
+)
+
+// TransportError reports a terminal read or write failure from the QMI transport.
+type TransportError struct {
+	Operation TransportOperation
+	Cause     error
+}
+
+func (e *TransportError) Error() string {
+	if e == nil {
+		return "QMI transport failure"
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("QMI transport %s failed", e.Operation)
+	}
+	return fmt.Sprintf("QMI transport %s failed: %v", e.Operation, e.Cause)
+}
+
+func (e *TransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// IsTransportError reports whether err contains a TransportError.
+func IsTransportError(err error) bool {
+	var transportErr *TransportError
+	return errors.As(err, &transportErr)
+}
+
+// GetTransportError extracts a TransportError from err.
+func GetTransportError(err error) *TransportError {
+	var transportErr *TransportError
+	if errors.As(err, &transportErr) {
+		return transportErr
+	}
+	return nil
+}
+
+// ErrClientClosed is returned when an operation starts after an explicit Close.
+var ErrClientClosed = errors.New("QMI client closed")
+
 // ============================================================================
 // QMI Error Types / QMI 错误类型
 // 提供结构化的错误信息，方便调用方进行错误处理和判断

@@ -16,8 +16,6 @@ func TestClientProxyOpenSkipsInitialSync(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-test0"
 
 	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
-		defer conn.Close()
-
 		openReq, err := readQMIFrameFromConn(conn)
 		if err != nil {
 			return err
@@ -548,6 +546,9 @@ func withProxyTransportForTest(t *testing.T, server func(net.Conn) error) <-chan
 	errCh := make(chan error, 1)
 	restore := replaceProxyTransportForTest(t, func(ctx context.Context, opts ClientOptions) (qmiTransport, error) {
 		clientConn, serverConn := net.Pipe()
+		t.Cleanup(func() {
+			_ = serverConn.Close()
+		})
 		go func() {
 			errCh <- server(serverConn)
 		}()
