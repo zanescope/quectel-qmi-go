@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
+func TestClientProxyOpenSkipsInitialSync(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-test0"
 
 	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
@@ -35,14 +35,17 @@ func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
 			return err
 		}
 
-		syncReq, err := readQMIFrameFromConn(conn)
+		versionReq, err := readQMIFrameFromConn(conn)
 		if err != nil {
 			return err
 		}
-		if err := assertCTLRequest(syncReq, 0x0027); err != nil {
+		if err := assertCTLRequest(versionReq, CTLGetVersionInfo); err != nil {
 			return err
 		}
-		return writeCTLSuccess(conn, syncReq)
+		return writeCTLResponse(conn, versionReq, []TLV{
+			successTLV(),
+			{Type: 0x01, Value: []byte{0}},
+		})
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
