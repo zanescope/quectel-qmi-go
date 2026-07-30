@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -125,6 +126,7 @@ type coalescedEventStore struct {
 
 type transactionEntry struct {
 	ch       chan *Packet
+	errCh    chan error
 	service  uint8
 	msgID    uint16
 	txID     uint16
@@ -167,6 +169,9 @@ type Client struct {
 	recentTransactions     map[uint32]recentTransaction
 	lateResponseLastLog    time.Time
 	lateResponseSuppressed uint64
+	terminated             bool
+	terminalErr            error
+	closeErr               error
 	lastTxID               uint32 // atomic counter / 原子计数器
 	ctlTxID                uint32 // separate counter for CTL (1 byte) / CTL的独立计数器 (1字节)
 
@@ -179,7 +184,8 @@ type Client struct {
 	coalescedSignalCh chan struct{}
 	writeCh           chan writeRequest
 	closeCh           chan struct{}
-	closeOnce         sync.Once
+	finalizedCh       chan struct{}
+	terminateOnce     sync.Once
 	wg                sync.WaitGroup
 
 	coalescedMu sync.Mutex
@@ -344,6 +350,9 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 		}
 		if err := c.Sync(syncCtx); err != nil {
 			c.logf(ClientLogLevelDebug, "QMI: initial sync failed (non-fatal): %v", err)
+			if terminalErr := c.startupTerminalError(); terminalErr != nil {
+				return nil, terminalErr
+			}
 		}
 	}
 
@@ -360,11 +369,17 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 		}
 		if versions, err := c.GetServiceVersions(versionCtx); err != nil {
 			c.logf(ClientLogLevelDebug, "QMI: version info query failed (non-fatal): %v", err)
+			if terminalErr := c.startupTerminalError(); terminalErr != nil {
+				return nil, terminalErr
+			}
 		} else {
 			c.serviceVersions = ServiceVersionMap(versions)
 			c.versionQueried = true
 			c.logf(ClientLogLevelDebug, "QMI: modem 支持 %d 个 QMI 服务", len(versions))
 		}
+	}
+	if err := c.startupTerminalError(); err != nil {
+		return nil, err
 	}
 
 	return c, nil
@@ -417,6 +432,7 @@ func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) 
 		coalescedSignalCh:  make(chan struct{}, 1),
 		writeCh:            make(chan writeRequest, opts.TxQueueSize),
 		closeCh:            make(chan struct{}),
+		finalizedCh:        make(chan struct{}),
 		coalesced: coalescedEventStore{
 			events: make(map[string]Event),
 		},
@@ -427,21 +443,123 @@ func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) 
 	go c.readLoop()
 	go c.writerLoop()
 	go c.indicationLoop()
+	go c.finalize()
 
 	return c
 }
 
+func (c *Client) finalize() {
+	c.wg.Wait()
+	close(c.eventCh)
+	close(c.finalizedCh)
+}
+
+func (c *Client) requestTerminationErrorLocked() error {
+	if c.terminalErr != nil {
+		return c.terminalErr
+	}
+	return ErrClientClosed
+}
+
+func (c *Client) requestTerminationError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requestTerminationErrorLocked()
+}
+
+func (c *Client) terminalRequestError() (error, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.terminated {
+		return nil, false
+	}
+	return c.requestTerminationErrorLocked(), true
+}
+
+func (c *Client) startupTerminalError() error {
+	err, terminated := c.terminalRequestError()
+	if !terminated {
+		return nil
+	}
+	if c.finalizedCh != nil {
+		<-c.finalizedCh
+	}
+	return err
+}
+
+func (c *Client) failPendingTransactionsLocked(cause error) {
+	for key, entry := range c.transactions {
+		delete(c.transactions, key)
+		if entry == nil || entry.errCh == nil {
+			continue
+		}
+		select {
+		case entry.errCh <- cause:
+		default:
+		}
+	}
+}
+
+// terminate publishes the terminal state and closes the transport exactly once.
+// Runtime loops may call it safely because waiting for those loops is delegated
+// to finalize.
+func (c *Client) terminate(cause error) bool {
+	if c == nil {
+		return false
+	}
+	won := false
+	c.terminateOnce.Do(func() {
+		won = true
+		c.mu.Lock()
+		c.terminated = true
+		c.terminalErr = cause
+		pendingCause := c.requestTerminationErrorLocked()
+		c.failPendingTransactionsLocked(pendingCause)
+		c.mu.Unlock()
+
+		close(c.closeCh)
+		var closeErr error
+		if c.conn != nil {
+			closeErr = c.conn.Close()
+		}
+		c.mu.Lock()
+		c.closeErr = closeErr
+		c.mu.Unlock()
+	})
+	return won
+}
+
 // Close shuts down the client / Close关闭客户端
 func (c *Client) Close() error {
-	var err error
-	c.closeOnce.Do(func() {
-		close(c.closeCh)
-		err = c.conn.Close()
-		c.wg.Wait()
-		c.failPendingTransactions(fmt.Errorf("client closed"))
-		close(c.eventCh)
-	})
-	return err
+	if c == nil {
+		return nil
+	}
+	c.terminate(nil)
+	if c.finalizedCh != nil {
+		<-c.finalizedCh
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeErr
+}
+
+// Done is closed when the client reaches a terminal state.
+func (c *Client) Done() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.closeCh
+}
+
+// Err returns the terminal transport error. An explicitly closed client has
+// a nil Err; callers can distinguish it from a live client with Done.
+func (c *Client) Err() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.terminalErr
 }
 
 // Events returns a channel for receiving asynchronous indications / Events返回用于接收异步指示的通道
@@ -584,22 +702,17 @@ func (c *Client) readLoop() {
 		// Set read deadline to allow periodic checking of closeCh / 设置读取截止时间以允许定期检查closeCh
 		_ = c.conn.SetReadDeadline(time.Now().Add(c.opts.ReadDeadline))
 
-		n, err := c.conn.Read(buf)
-		if err != nil {
-			if os.IsTimeout(err) {
-				continue
-			}
-			select {
-			case <-c.closeCh:
-				return
-			default:
-			}
-			c.logf(ClientLogLevelWarn, "QMI: read failed: %v", err)
-			c.failPendingTransactions(err)
-			return
-		}
-
+		n, readErr := c.conn.Read(buf)
 		if n <= 0 {
+			if readErr != nil && !os.IsTimeout(readErr) {
+				transportErr := &TransportError{Operation: TransportOperationRead, Cause: readErr}
+				if c.terminate(transportErr) {
+					// Keep user callbacks outside the tracked runtime loop so
+					// Logf may call Close without waiting for this goroutine.
+					go c.logf(ClientLogLevelWarn, "QMI: read failed: %v", transportErr)
+				}
+				return
+			}
 			continue
 		}
 
@@ -669,6 +782,18 @@ func (c *Client) readLoop() {
 			}
 			c.dispatchIndication(packet)
 		}
+
+		// io.Reader permits returning data and an error together. Dispatch every
+		// complete frame above before publishing the accompanying terminal error.
+		if readErr != nil && !os.IsTimeout(readErr) {
+			transportErr := &TransportError{Operation: TransportOperationRead, Cause: readErr}
+			if c.terminate(transportErr) {
+				// Keep user callbacks outside the tracked runtime loop so
+				// Logf may call Close without waiting for this goroutine.
+				go c.logf(ClientLogLevelWarn, "QMI: read failed: %v", transportErr)
+			}
+			return
+		}
 	}
 }
 
@@ -680,9 +805,30 @@ func (c *Client) writerLoop() {
 		case <-c.closeCh:
 			return
 		case req := <-c.writeCh:
-			err := c.writeAll(req.data)
 			select {
-			case req.result <- err:
+			case <-c.closeCh:
+				err := c.requestTerminationError()
+				select {
+				case req.result <- err:
+				default:
+				}
+				return
+			default:
+			}
+
+			err := c.writeAll(req.data)
+			if err != nil {
+				transportErr := &TransportError{Operation: TransportOperationWrite, Cause: err}
+				c.terminate(transportErr)
+				err = c.requestTerminationError()
+				select {
+				case req.result <- err:
+				default:
+				}
+				return
+			}
+			select {
+			case req.result <- nil:
 			default:
 			}
 		}
@@ -726,20 +872,14 @@ func (c *Client) writeAll(data []byte) error {
 	for written < len(data) {
 		n, err := c.conn.Write(data[written:])
 		if err != nil {
-			return fmt.Errorf("write failed: %w", err)
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
 		}
 		written += n
 	}
 	return nil
-}
-
-func (c *Client) failPendingTransactions(cause error) {
-	c.mu.Lock()
-	for key, entry := range c.transactions {
-		delete(c.transactions, key)
-		close(entry.ch)
-	}
-	c.mu.Unlock()
 }
 
 func (c *Client) enqueueIndication(event Event) {
@@ -925,8 +1065,23 @@ func (c *Client) handleClientIDRevoke(p *Packet) {
 // Request/Response handling / 请求/响应处理
 // ============================================================================
 
+func takeReadyResponse(respCh <-chan *Packet) (*Packet, bool) {
+	select {
+	case resp, ok := <-respCh:
+		if ok && resp != nil {
+			return resp, true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
+}
+
 // SendRequest sends a QMI request and waits for response / SendRequest发送QMI请求并等待响应
 func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8, msgID uint16, tlvs []TLV) (resp *Packet, err error) {
+	if terminalErr, terminated := c.terminalRequestError(); terminated {
+		return nil, terminalErr
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -958,10 +1113,12 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 
 	// Create response channel / 创建响应通道
 	respCh := make(chan *Packet, 1)
+	errCh := make(chan error, 1)
 	key := uint32(service)<<16 | uint32(txID)
 	deadline, _ := ctx.Deadline()
 	entry := &transactionEntry{
 		ch:       respCh,
+		errCh:    errCh,
 		service:  service,
 		msgID:    msgID,
 		txID:     txID,
@@ -969,6 +1126,11 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 		deadline: deadline,
 	}
 	c.mu.Lock()
+	if c.terminated {
+		terminalErr := c.requestTerminationErrorLocked()
+		c.mu.Unlock()
+		return nil, terminalErr
+	}
 	c.transactions[key] = entry
 	c.mu.Unlock()
 
@@ -996,9 +1158,14 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 	select {
 	case c.writeCh <- writeReq:
 	case <-ctx.Done():
+		if terminalErr, terminated := c.terminalRequestError(); terminated {
+			return nil, terminalErr
+		}
 		return nil, ctx.Err()
+	case terminalErr := <-errCh:
+		return nil, terminalErr
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		return nil, c.requestTerminationError()
 	}
 
 	select {
@@ -1007,22 +1174,50 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 			return nil, err
 		}
 	case <-ctx.Done():
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		if terminalErr, terminated := c.terminalRequestError(); terminated {
+			return nil, terminalErr
+		}
 		return nil, ctx.Err()
+	case terminalErr := <-errCh:
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		return nil, terminalErr
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		return nil, c.requestTerminationError()
 	}
 
 	// Wait for response / 等待响应
 	select {
 	case resp, ok := <-respCh:
 		if !ok || resp == nil {
-			return nil, fmt.Errorf("connection closed")
+			return nil, c.requestTerminationError()
 		}
 		return resp, nil
 	case <-ctx.Done():
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		if terminalErr, terminated := c.terminalRequestError(); terminated {
+			return nil, terminalErr
+		}
 		return nil, ctx.Err()
+	case terminalErr := <-errCh:
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		return nil, terminalErr
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		if resp, ok := takeReadyResponse(respCh); ok {
+			return resp, nil
+		}
+		return nil, c.requestTerminationError()
 	}
 }
 

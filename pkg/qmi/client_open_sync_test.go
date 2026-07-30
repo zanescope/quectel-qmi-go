@@ -119,6 +119,9 @@ func withRawTransportForTest(t *testing.T, wantPath string, server func(net.Conn
 			return nil, fmt.Errorf("raw path = %q, want %q", path, wantPath)
 		}
 		clientConn, serverConn := net.Pipe()
+		t.Cleanup(func() {
+			_ = serverConn.Close()
+		})
 		go func() {
 			errCh <- server(serverConn)
 		}()
@@ -129,8 +132,6 @@ func withRawTransportForTest(t *testing.T, wantPath string, server func(net.Conn
 }
 
 func serveRawOpenHandshake(conn net.Conn, wantSync bool) error {
-	defer conn.Close()
-
 	request, err := readQMIFrameFromConn(conn)
 	if err != nil {
 		return err
