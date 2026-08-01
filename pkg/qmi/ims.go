@@ -26,6 +26,13 @@ func (i *IMSService) Close() error {
 	return i.client.ReleaseClientID(ServiceIMS, i.clientID)
 }
 
+func (i *IMSService) ClientID() uint8 {
+	if i == nil {
+		return 0
+	}
+	return i.clientID
+}
+
 // ============================================================================
 // IMS Types / IMS 类型
 // ============================================================================

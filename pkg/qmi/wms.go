@@ -40,6 +40,13 @@ func (w *WMSService) Close() error {
 	return w.client.ReleaseClientID(ServiceWMS, w.clientID)
 }
 
+func (w *WMSService) ClientID() uint8 {
+	if w == nil {
+		return 0
+	}
+	return w.clientID
+}
+
 // ============================================================================
 // SMS Operations / 短信操作
 // ============================================================================

@@ -205,6 +205,9 @@ func (d *DMSService) Close() error {
 }
 
 func (d *DMSService) ClientID() uint8 {
+	if d == nil {
+		return 0
+	}
 	return d.clientID
 }
 
