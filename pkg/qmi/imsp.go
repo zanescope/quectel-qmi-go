@@ -27,6 +27,13 @@ func (i *IMSPService) Close() error {
 	return i.client.ReleaseClientID(ServiceIMSP, i.clientID)
 }
 
+func (i *IMSPService) ClientID() uint8 {
+	if i == nil {
+		return 0
+	}
+	return i.clientID
+}
+
 // ============================================================================
 // IMSP Types / IMSP 类型
 // ============================================================================
