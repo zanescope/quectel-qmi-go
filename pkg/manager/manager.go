@@ -159,22 +159,23 @@ type RecoveryPolicy struct {
 }
 
 type ManagerStats struct {
-	StatusChecks             uint64
-	DebouncedChecks          uint64
-	ReconnectScheduled       uint64
-	StaleTimerIgnored        uint64
-	ResetEvents              uint64
-	ResetCoalesced           uint64
-	CoreRecoveryRequests     uint64
-	CoreRecoveryCoalesced    uint64
-	CoreRecoverySuppressed   uint64
-	CoreRecoverySuccess      uint64
-	CoreRecoveryFailures     uint64
-	RecoverAttempts          uint64
-	RecoverSuccess           uint64
-	RecoverBackoffMs         uint64
-	ServiceTimeouts          uint64
-	ServiceTimeoutRecoveries uint64
+	StatusChecks               uint64
+	DebouncedChecks            uint64
+	ReconnectScheduled         uint64
+	StaleTimerIgnored          uint64
+	ResetEvents                uint64
+	ResetCoalesced             uint64
+	CoreRecoveryRequests       uint64
+	CoreRecoveryCoalesced      uint64
+	CoreRecoverySuppressed     uint64
+	CoreRecoverySuccess        uint64
+	CoreRecoveryFailures       uint64
+	RecoverAttempts            uint64
+	RecoverSuccess             uint64
+	RecoverBackoffMs           uint64
+	ServiceTimeouts            uint64
+	ServiceTimeoutRecoveries   uint64
+	ListenerIndicationsDropped uint64
 }
 
 // ============================================================================
@@ -217,6 +218,7 @@ type Manager struct {
 	stopErr              error
 	stopped              bool
 	lifecycleMu          sync.Mutex
+	indicationDispatchMu sync.RWMutex
 	timerCallbackMu      sync.Mutex
 	timerCallbackWG      sync.WaitGroup
 	timerCallbacksPaused bool
@@ -245,13 +247,17 @@ type Manager struct {
 
 	// Event handling
 	// Event handling / 事件处理
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	eventCh          chan internalEventEnvelope
-	backgroundTaskMu sync.Mutex
-	backgroundTaskWG sync.WaitGroup
-	events           *EventEmitter // External event callbacks / 外部事件回调
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	wg                    sync.WaitGroup
+	eventCh               chan internalEventEnvelope
+	listenerIndicationCh  chan listenerIndication
+	listenerBinding       *listenerBinding
+	listenerChanged       chan struct{}
+	nextListenerBindingID uint64
+	backgroundTaskMu      sync.Mutex
+	backgroundTaskWG      sync.WaitGroup
+	events                *EventEmitter // External event callbacks / 外部事件回调
 
 	// Reconnection / 重连相关
 	retryCount          int
@@ -394,22 +400,23 @@ type Manager struct {
 	scheduledTimerClaimedHook         func()
 	scheduledTimerBeforeClaimHook     func()
 
-	statusChecks             atomic.Uint64
-	debouncedChecks          atomic.Uint64
-	reconnectScheduled       atomic.Uint64
-	staleTimerIgnored        atomic.Uint64
-	resetEvents              atomic.Uint64
-	resetCoalesced           atomic.Uint64
-	coreRecoveryRequests     atomic.Uint64
-	coreRecoveryCoalesced    atomic.Uint64
-	coreRecoverySuppressed   atomic.Uint64
-	coreRecoverySuccess      atomic.Uint64
-	coreRecoveryFailures     atomic.Uint64
-	recoverAttempts          atomic.Uint64
-	recoverSuccess           atomic.Uint64
-	recoverBackoffMs         atomic.Uint64
-	serviceTimeouts          atomic.Uint64
-	serviceTimeoutRecoveries atomic.Uint64
+	statusChecks               atomic.Uint64
+	debouncedChecks            atomic.Uint64
+	reconnectScheduled         atomic.Uint64
+	staleTimerIgnored          atomic.Uint64
+	resetEvents                atomic.Uint64
+	resetCoalesced             atomic.Uint64
+	coreRecoveryRequests       atomic.Uint64
+	coreRecoveryCoalesced      atomic.Uint64
+	coreRecoverySuppressed     atomic.Uint64
+	coreRecoverySuccess        atomic.Uint64
+	coreRecoveryFailures       atomic.Uint64
+	recoverAttempts            atomic.Uint64
+	recoverSuccess             atomic.Uint64
+	recoverBackoffMs           atomic.Uint64
+	serviceTimeouts            atomic.Uint64
+	serviceTimeoutRecoveries   atomic.Uint64
+	listenerIndicationsDropped atomic.Uint64
 
 	// 设备状态快照（由 NAS Indication 事件驱动，供上层零 IPC 读取）
 	snapshot DeviceSnapshot
@@ -668,6 +675,8 @@ func New(cfg Config, logger Logger) *Manager {
 		retryDelays:           append([]time.Duration(nil), cfg.RetryPolicy.ReconnectDelays...),
 		reinitDelays:          append([]time.Duration(nil), cfg.RetryPolicy.ReinitDelays...),
 		eventCh:               make(chan internalEventEnvelope, 16),
+		listenerIndicationCh:  make(chan listenerIndication, listenerIndicationQueueSize),
+		listenerChanged:       make(chan struct{}, 1),
 		events:                NewEventEmitterWithQueueSize(cfg.EventPolicy.CallbackQueueSize),
 		scheduledTimers:       make(map[*time.Timer]struct{}),
 		modemResetDedupWindow: defaultModemResetDedupWindow,
@@ -864,18 +873,28 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	// resurrecting readiness.
 	m.mu.Lock()
 	startErr := operationCtx.Err()
+	startFailureStage := "start_commit_canceled"
 	if startErr == nil && (m.stopped || m.state == StateStopping || m.coreGeneration.Load() != generation) {
 		startErr = context.Canceled
 	}
+	if startErr == nil && m.currentListenerTerminalLocked(generation) {
+		terminalErr := m.listenerBinding.err()
+		if terminalErr == nil {
+			terminalErr = errQMIClientEventStreamClosed
+		}
+		startErr = fmt.Errorf("QMI transport terminated before startup commit: %w", terminalErr)
+		startFailureStage = "start_transport_terminal"
+	}
 	if startErr != nil {
 		m.mu.Unlock()
-		cleanupFailedStart("start_commit_canceled", startErr)
+		cleanupFailedStart(startFailureStage, startErr)
 		return startErr
 	}
 
-	m.wg.Add(2)
+	m.wg.Add(3)
 	go m.eventLoop(runCtx)
 	go m.indicationHandler(runCtx)
+	go m.listenerIndicationHandler(runCtx)
 
 	if m.state != StateDisconnected {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
@@ -905,8 +924,10 @@ func (m *Manager) Stop() error {
 }
 
 func (m *Manager) stopOnceBody() error {
+	m.indicationDispatchMu.Lock()
 	m.mu.Lock()
 	m.modemResetMu.Lock()
+	m.retireListenerBindingLocked(nil)
 	m.stopped = true
 	m.lifetimeActive = false
 	m.desiredConnection = false
@@ -921,6 +942,7 @@ func (m *Manager) stopOnceBody() error {
 	m.modemResetMu.Unlock()
 	cancel := m.cancel
 	m.mu.Unlock()
+	m.indicationDispatchMu.Unlock()
 
 	m.log.Info("Stopping connection manager...")
 	if cancel != nil {
@@ -1354,22 +1376,23 @@ func (m *Manager) Stats() ManagerStats {
 		return ManagerStats{}
 	}
 	return ManagerStats{
-		StatusChecks:             m.statusChecks.Load(),
-		DebouncedChecks:          m.debouncedChecks.Load(),
-		ReconnectScheduled:       m.reconnectScheduled.Load(),
-		StaleTimerIgnored:        m.staleTimerIgnored.Load(),
-		ResetEvents:              m.resetEvents.Load(),
-		ResetCoalesced:           m.resetCoalesced.Load(),
-		CoreRecoveryRequests:     m.coreRecoveryRequests.Load(),
-		CoreRecoveryCoalesced:    m.coreRecoveryCoalesced.Load(),
-		CoreRecoverySuppressed:   m.coreRecoverySuppressed.Load(),
-		CoreRecoverySuccess:      m.coreRecoverySuccess.Load(),
-		CoreRecoveryFailures:     m.coreRecoveryFailures.Load(),
-		RecoverAttempts:          m.recoverAttempts.Load(),
-		RecoverSuccess:           m.recoverSuccess.Load(),
-		RecoverBackoffMs:         m.recoverBackoffMs.Load(),
-		ServiceTimeouts:          m.serviceTimeouts.Load(),
-		ServiceTimeoutRecoveries: m.serviceTimeoutRecoveries.Load(),
+		StatusChecks:               m.statusChecks.Load(),
+		DebouncedChecks:            m.debouncedChecks.Load(),
+		ReconnectScheduled:         m.reconnectScheduled.Load(),
+		StaleTimerIgnored:          m.staleTimerIgnored.Load(),
+		ResetEvents:                m.resetEvents.Load(),
+		ResetCoalesced:             m.resetCoalesced.Load(),
+		CoreRecoveryRequests:       m.coreRecoveryRequests.Load(),
+		CoreRecoveryCoalesced:      m.coreRecoveryCoalesced.Load(),
+		CoreRecoverySuppressed:     m.coreRecoverySuppressed.Load(),
+		CoreRecoverySuccess:        m.coreRecoverySuccess.Load(),
+		CoreRecoveryFailures:       m.coreRecoveryFailures.Load(),
+		RecoverAttempts:            m.recoverAttempts.Load(),
+		RecoverSuccess:             m.recoverSuccess.Load(),
+		RecoverBackoffMs:           m.recoverBackoffMs.Load(),
+		ServiceTimeouts:            m.serviceTimeouts.Load(),
+		ServiceTimeoutRecoveries:   m.serviceTimeoutRecoveries.Load(),
+		ListenerIndicationsDropped: m.listenerIndicationsDropped.Load(),
 	}
 }
 
@@ -3953,6 +3976,7 @@ func (m *Manager) cleanupLocked(cleanupCtx context.Context) {
 	m.imsa = nil
 	m.imsp = nil
 	m.voice = nil
+	m.retireListenerBindingLocked(client)
 	m.client = nil
 	m.handleV4 = 0
 	m.handleV6 = 0
@@ -4382,6 +4406,7 @@ func (m *Manager) rollbackClientAllocationAttempt(client *qmi.Client) {
 	m.imsa = nil
 	m.imsp = nil
 	m.voice = nil
+	m.retireListenerBindingLocked(client)
 	m.client = nil
 	m.handleV4 = 0
 	m.handleV6 = 0
@@ -4478,6 +4503,7 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context, reason Open
 
 			m.mu.Lock()
 			m.client = client
+			m.publishListenerBindingLocked(client, m.coreGeneration.Load(), m.ctx)
 			m.mu.Unlock()
 
 			err = m.allocateServices(initCtx)
@@ -4648,6 +4674,7 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	desiredConnection := m.desiredConnection
 	m.reconnectPending = false
 	m.reconnectGeneration = 0
+	m.retireListenerBindingLocked(m.client)
 	generation := m.coreGeneration.Add(1)
 	request.generation = generation
 	result.generation = generation
@@ -4809,6 +4836,30 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 		staleRecovery {
 		m.modemResetMu.Unlock()
 		m.mu.Unlock()
+		return result
+	}
+	if m.currentListenerTerminalLocked(generation) {
+		terminalBinding := m.listenerBinding
+		terminalErr := terminalBinding.err()
+		if terminalErr == nil {
+			terminalErr = errQMIClientEventStreamClosed
+		}
+		// Retire the failed stream in the same state transaction that rejects
+		// readiness. The blocked listener can no longer enqueue transport_down
+		// after this attempt schedules backoff or commits Terminal.
+		m.retireListenerBindingLocked(terminalBinding.client)
+
+		m.markControlNotReadyLocked("recover_transport_terminal")
+		m.markCoreNotReadyLocked("recover_transport_terminal", terminalErr)
+		m.setCorePhaseLocked(CorePhaseRecovering, "recover_transport_terminal", string(request.reason), terminalErr)
+		m.publishCoreStatusLocked()
+		m.modemResetMu.Unlock()
+		m.mu.Unlock()
+		retryResult := m.scheduleRecoverRetryFor(request, "transport_terminal")
+		if retryResult.terminalReason != "" {
+			result.terminalReason = retryResult.terminalReason
+			result.terminalErr = terminalErr
+		}
 		return result
 	}
 	if pendingReset {
@@ -5895,59 +5946,87 @@ func (m *Manager) indicationHandler(runCtx context.Context) {
 	defer m.wg.Done()
 
 	for {
-		if runCtx.Err() != nil {
-			return
-		}
-
-		m.mu.RLock()
-		client := m.client
-		generation := m.coreGeneration.Load()
-		m.mu.RUnlock()
-
-		if client == nil {
-			time.Sleep(200 * time.Millisecond)
+		binding, changed := m.listenerBindingSnapshot()
+		if binding == nil {
+			if !waitForListenerChange(runCtx, nil, changed) {
+				return
+			}
 			continue
 		}
 
-		eventsCh := client.Events()
-	readEvents:
-		for {
-			select {
-			case <-runCtx.Done():
+		if binding.terminal() {
+			m.reportListenerTerminal(binding)
+			if !waitForListenerChange(runCtx, binding, changed) {
 				return
-			case evt, ok := <-eventsCh:
-				if !ok {
-					time.Sleep(200 * time.Millisecond)
-					break readEvents
-				}
-				m.handleIndicationForSession(client, generation, evt)
 			}
+			continue
+		}
+
+		select {
+		case <-runCtx.Done():
+			return
+		case <-binding.runCtx.Done():
+			return
+		case <-binding.retired:
+		case <-changed:
+		case <-binding.done:
+			m.reportListenerTerminal(binding)
+			if !waitForListenerChange(runCtx, binding, changed) {
+				return
+			}
+		case evt, ok := <-binding.events:
+			if !ok {
+				m.reportListenerTerminal(binding)
+				if !waitForListenerChange(runCtx, binding, changed) {
+					return
+				}
+				continue
+			}
+			if evt.Type == qmi.EventModemReset {
+				m.handleModemResetForBinding(binding, evt)
+				continue
+			}
+			m.queueListenerIndication(runCtx, binding, evt)
 		}
 	}
 }
 
-func (m *Manager) handleIndicationForSession(client *qmi.Client, generation uint64, evt qmi.Event) {
-	if m == nil || client == nil || generation == 0 {
+func (m *Manager) handleIndicationForBinding(binding *listenerBinding, evt qmi.Event) {
+	if m == nil || binding == nil {
+		return
+	}
+
+	// A modem reset is a recovery input, not an ordinary indication side
+	// effect. It must remain observable while recovery owns lifecycleMu and is
+	// waiting for its reset quiet window. Exact binding validation still makes
+	// stale or replaced streams harmless.
+	if evt.Type == qmi.EventModemReset {
+		m.handleModemResetForBinding(binding, evt)
 		return
 	}
 
 	// Core replacement is serialized by lifecycleMu. Holding it across the
 	// handler makes validation and all snapshot/event side effects one exact
-	// client-generation operation.
+	// listener-binding operation. The receive loop dispatches ordinary events
+	// through a bounded worker, so waiting here never hides a later modem reset.
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
+	m.indicationDispatchMu.RLock()
+	defer m.indicationDispatchMu.RUnlock()
 	m.mu.RLock()
-	runCtx := m.ctx
-	active := !m.stopped &&
-		m.state != StateStopping &&
-		m.client == client &&
-		m.coreGeneration.Load() == generation &&
-		runCtx != nil &&
-		runCtx.Err() == nil
+	active := m.listenerBindingUsableLocked(binding)
 	m.mu.RUnlock()
 	if active {
 		m.handleIndication(evt)
 	}
+}
+
+func (m *Manager) handleModemResetForBinding(binding *listenerBinding, evt qmi.Event) {
+	if shouldLogRawIndication(evt) {
+		m.log.Debugf("Indication: type=%d service=0x%02x msg=0x%04x", evt.Type, evt.ServiceID, evt.MessageID)
+	}
+	event := m.qmiIndicationEvent(EventModemReset, evt)
+	m.enqueueModemResetEventForBinding("qmi_indication", binding, &event)
 }
 
 func (m *Manager) handleIndication(evt qmi.Event) {
