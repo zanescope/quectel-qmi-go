@@ -11,21 +11,24 @@ import (
 )
 
 func newRecoveryTestManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		log:                   NewNopLogger(),
 		events:                NewEventEmitter(),
-		eventCh:               make(chan internalEvent, 8),
+		eventCh:               make(chan internalEventEnvelope, 8),
 		scheduledTimers:       make(map[*time.Timer]struct{}),
 		modemResetDedupWindow: defaultModemResetDedupWindow,
 		uimRecoverCooldown:    defaultUIMRecoverCooldown,
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.coreGeneration.Store(1)
+	return m
 }
 
-func waitInternalRecoveryEvent(t *testing.T, ch <-chan internalEvent, timeout time.Duration) internalEvent {
+func waitInternalRecoveryEvent(t *testing.T, ch <-chan internalEventEnvelope, timeout time.Duration) internalEvent {
 	t.Helper()
 	select {
 	case evt := <-ch:
-		return evt
+		return evt.kind
 	case <-time.After(timeout):
 		t.Fatalf("timed out waiting for internal event after %s", timeout)
 		return 0
@@ -814,7 +817,7 @@ func TestHandleModemResetEventCoalescesWhileRecovering(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.modemResetRecovering = true
 
-	m.handleEvent(eventModemReset)
+	m.enqueueModemResetEvent("test")
 
 	select {
 	case evt := <-m.eventCh:

@@ -246,6 +246,9 @@ func TestClientFallsBackToRawWhenProxyTransportOpenFails(t *testing.T) {
 	if client.opts.UseProxy {
 		t.Fatal("client.opts.UseProxy=true after fallback, want false")
 	}
+	if client.UsesProxy() {
+		t.Fatal("UsesProxy()=true after proxy transport fallback, want false")
+	}
 }
 
 func TestClientDoesNotFallbackToRawAfterCallerCancellation(t *testing.T) {
@@ -537,6 +540,9 @@ func TestClientFallsBackToRawWhenProxyDeviceOpenFails(t *testing.T) {
 	}
 	if client.opts.UseProxy {
 		t.Fatal("client.opts.UseProxy=true after fallback, want false")
+	}
+	if client.UsesProxy() {
+		t.Fatal("UsesProxy()=true after proxy device-open fallback, want false")
 	}
 }
 

@@ -12,7 +12,7 @@ func TestHandleIndicationNASSysInfoUsesIndicationID(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 
 	sysInfoTLV := make([]byte, 29)
@@ -41,7 +41,7 @@ func TestHandleIndicationNASOperatorNameChanged(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	ch := make(chan Event, 1)
 	snapSeen := make(chan string, 1)
@@ -86,7 +86,7 @@ func TestHandleIndicationSuppressesEmptyNASEventReport(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitterWithQueueSize(1),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 
 	m.handleIndication(qmi.Event{
@@ -111,7 +111,7 @@ func TestHandleIndicationEmitsNonEmptyNASEventReport(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitterWithQueueSize(2),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	ch := make(chan Event, 1)
 	m.OnEvent(func(evt Event) {
@@ -144,7 +144,7 @@ func TestHandleIndicationNASEventReportDoesNotScheduleTargetedCheck(t *testing.T
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitterWithQueueSize(2),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 
 	m.handleIndication(qmi.Event{
@@ -171,7 +171,7 @@ func TestHandleIndicationNASNetworkTimeChanged(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	m.handleIndication(qmi.Event{
 		Type: qmi.EventNASNetworkTimeChanged,
@@ -190,7 +190,7 @@ func TestHandleIndicationNASNetworkTimeSplitTLVs(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	m.handleIndication(qmi.Event{
 		Type: qmi.EventNASNetworkTimeChanged,
@@ -212,7 +212,7 @@ func TestHandleIndicationNASSignalInfoChanged(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	rsrq := int8(-9)
 	m.handleIndication(qmi.Event{
@@ -233,7 +233,7 @@ func TestHandleIndicationNASNetworkReject(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	m.handleIndication(qmi.Event{
 		Type: qmi.EventNASNetworkReject,
@@ -253,7 +253,7 @@ func TestHandleIndicationNASIncrementalScanMergesResults(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 
 	m.handleIndication(qmi.Event{
@@ -299,7 +299,7 @@ func TestHandleIndicationUIMRefreshUpdatesSnapshot(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	ch := make(chan Event, 1)
 	m.OnEvent(func(evt Event) {
@@ -340,7 +340,7 @@ func TestHandleIndicationUIMSlotStatusUpdatesSnapshot(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	ch := make(chan Event, 1)
 	m.OnEvent(func(evt Event) {
@@ -385,7 +385,7 @@ func TestHandleIndicationServingSystemPartialPLMNDoesNotOverrideRegistration(t *
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	m.snapshot.updateServingFromQuery(&qmi.ServingSystem{
 		RegistrationState: qmi.RegStateRegistered,
@@ -419,7 +419,7 @@ func TestHandleIndicationServingSystemOnlyServingKeepsPLMN(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 	m.snapshot.updateServingFromQuery(&qmi.ServingSystem{
 		RegistrationState: qmi.RegStateRegistered,
@@ -452,7 +452,7 @@ func TestHandleIndicationServingSystemOnlyServingOnEmptySnapshot(t *testing.T) {
 	m := &Manager{
 		log:     NewNopLogger(),
 		events:  NewEventEmitter(),
-		eventCh: make(chan internalEvent, 1),
+		eventCh: make(chan internalEventEnvelope, 1),
 	}
 
 	m.handleIndication(qmi.Event{

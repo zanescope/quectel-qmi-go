@@ -59,27 +59,43 @@ func TestRunCleanupTasksWaitsForCompletion(t *testing.T) {
 	}
 }
 
-func TestRunCleanupTasksStopsWaitingAtContextDeadline(t *testing.T) {
+func TestRunCleanupTasksCancelsButJoinsAtContextDeadline(t *testing.T) {
 	release := make(chan struct{})
-	defer close(release)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	start := time.Now()
-	results := runCleanupTasks(ctx, NewNopLogger(), []cleanupTask{{
-		name: "blocked",
-		run: func(context.Context) error {
-			<-release
-			return nil
-		},
-	}})
-	elapsed := time.Since(start)
+	canceled := make(chan struct{})
+	done := make(chan []cleanupTaskResult, 1)
+	go func() {
+		done <- runCleanupTasks(ctx, NewNopLogger(), []cleanupTask{{
+			name: "blocked",
+			run: func(taskCtx context.Context) error {
+				<-taskCtx.Done()
+				close(canceled)
+				<-release
+				return taskCtx.Err()
+			},
+		}})
+	}()
 
-	if elapsed >= 90*time.Millisecond {
-		t.Fatalf("runCleanupTasks elapsed = %s, want deadline-bounded wait", elapsed)
+	select {
+	case <-canceled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("cleanup task did not receive deadline cancellation")
 	}
-	if len(results) != 1 || results[0].name != "blocked" || results[0].err == nil {
-		t.Fatalf("cleanup task results = %#v, want blocked task with deadline error", results)
+	select {
+	case results := <-done:
+		t.Fatalf("runCleanupTasks orphaned blocked worker: %#v", results)
+	default:
+	}
+
+	close(release)
+	select {
+	case results := <-done:
+		if len(results) != 1 || results[0].name != "blocked" || results[0].err == nil {
+			t.Fatalf("cleanup task results = %#v, want joined task with deadline error", results)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("runCleanupTasks did not return after canceled worker exited")
 	}
 }

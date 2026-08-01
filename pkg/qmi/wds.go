@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
 )
 
 const (
@@ -282,7 +283,17 @@ func NewWDSServiceWithContext(ctx context.Context, client *Client) (*WDSService,
 
 // Close releases the WDS client ID / Close释放WDS客户端ID
 func (w *WDSService) Close() error {
-	return w.client.ReleaseClientID(ServiceWDS, w.clientID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return w.CloseWithContext(ctx)
+}
+
+// CloseWithContext releases the WDS client ID while honoring cancellation.
+func (w *WDSService) CloseWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return w.client.ReleaseClientIDWithContext(ctx, ServiceWDS, w.clientID)
 }
 
 func (w *WDSService) ClientID() uint8 {
