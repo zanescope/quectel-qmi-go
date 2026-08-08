@@ -27,6 +27,13 @@ func (i *IMSAService) Close() error {
 	return i.client.ReleaseClientID(ServiceIMSA, i.clientID)
 }
 
+func (i *IMSAService) ClientID() uint8 {
+	if i == nil {
+		return 0
+	}
+	return i.clientID
+}
+
 // ============================================================================
 // IMSA Types / IMSA 类型
 // ============================================================================

@@ -122,6 +122,69 @@ func TestClientProxyAllocateClientIDAfterOpen(t *testing.T) {
 	}
 }
 
+func TestOldWDSServiceCloseAfterRebindKeepsNewClientID(t *testing.T) {
+	const (
+		devicePath    = "/dev/cdc-wdm-stale-close"
+		staleClientID = 0x31
+		boundClientID = 0x32
+	)
+
+	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
+		openReq, err := readQMIFrameFromConn(conn)
+		if err != nil {
+			return err
+		}
+		if err := assertCTLRequest(openReq, CTLInternalProxyOpen); err != nil {
+			return err
+		}
+		if err := writeCTLSuccess(conn, openReq); err != nil {
+			return err
+		}
+
+		releaseReq, err := readQMIFrameFromConn(conn)
+		if err != nil {
+			return err
+		}
+		if err := assertCTLRequest(releaseReq, CTLReleaseClientID); err != nil {
+			return err
+		}
+		tlv := FindTLV(releaseReq.TLVs, 0x01)
+		if tlv == nil || len(tlv.Value) != 2 ||
+			tlv.Value[0] != ServiceWDS || tlv.Value[1] != staleClientID {
+			return fmt.Errorf("release client ID TLV = %#v, want WDS/0x%02x", tlv, staleClientID)
+		}
+		return writeCTLSuccess(conn, releaseReq)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+		UseProxy:     true,
+		SyncOnOpen:   false,
+		ReadDeadline: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions() error = %v", err)
+	}
+	defer client.Close()
+
+	staleService := &WDSService{client: client, clientID: staleClientID}
+	client.mu.Lock()
+	client.clientIDs[ServiceWDS] = boundClientID
+	client.mu.Unlock()
+
+	if err := staleService.CloseWithContext(ctx); err != nil {
+		t.Fatalf("stale WDS CloseWithContext() error = %v", err)
+	}
+	if got := client.GetClientID(ServiceWDS); got != boundClientID {
+		t.Fatalf("cached WDS client ID=0x%02x want rebound ID 0x%02x", got, boundClientID)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAllocateClientIDWithContextUnsupportedServiceReturnsErrServiceNotSupported(t *testing.T) {
 	client := &Client{
 		transactions:    make(map[uint32]*transactionEntry),

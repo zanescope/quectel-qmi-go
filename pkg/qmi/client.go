@@ -52,8 +52,20 @@ const (
 type Event struct {
 	Type      EventType
 	ServiceID uint8
+	ClientID  uint8
 	MessageID uint16
 	Packet    *Packet
+
+	// RevokedClient identifies the service session named by a valid CTL
+	// revoke-client-ID indication. ClientID above remains the QMUX client ID
+	// carried by Packet (normally zero for CTL packets).
+	RevokedClient *ClientIdentity
+}
+
+// ClientIdentity identifies one QMI service session.
+type ClientIdentity struct {
+	ServiceID uint8
+	ClientID  uint8
 }
 
 type ClientLogLevel string
@@ -955,39 +967,50 @@ func (c *Client) popCoalescedEvent() (Event, bool) {
 func (c *Client) coalescingKey(event Event) (string, bool) {
 	switch event.Type {
 	case EventPacketServiceStatusChanged:
-		return fmt.Sprintf("packet-status:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("packet-status", event), true
 	case EventServingSystemChanged:
-		return fmt.Sprintf("serving-system:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("serving-system", event), true
 	case EventNASOperatorNameChanged:
-		return fmt.Sprintf("nas-operator-name:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-operator-name", event), true
 	case EventNASNetworkTimeChanged:
-		return fmt.Sprintf("nas-network-time:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-network-time", event), true
 	case EventNASSignalInfoChanged:
-		return fmt.Sprintf("nas-signal-info:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-signal-info", event), true
 	case EventNASNetworkReject:
-		return fmt.Sprintf("nas-network-reject:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-network-reject", event), true
 	case EventNASIncrementalNetworkScan:
-		return fmt.Sprintf("nas-incremental-scan:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-incremental-scan", event), true
 	case EventNASEventReport:
-		return fmt.Sprintf("nas-event-report:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("nas-event-report", event), true
 	case EventWMSTransportNetworkRegistrationStatus:
-		return fmt.Sprintf("wms-transport:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("wms-transport", event), true
 	case EventModemReset:
-		return fmt.Sprintf("critical-modem-reset:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("critical-modem-reset", event), true
 	case EventUIMSessionClosed:
-		return fmt.Sprintf("critical-uim-session-closed:%d:%d", event.ServiceID, event.MessageID), true
+		return indicationIdentityKey("critical-uim-session-closed", event), true
 	default:
 		return "", false
 	}
 }
 
+func indicationIdentityKey(prefix string, event Event) string {
+	if event.RevokedClient != nil {
+		return fmt.Sprintf("%s:%d:%d:%d:%d:%d", prefix, event.ServiceID, event.ClientID, event.MessageID,
+			event.RevokedClient.ServiceID, event.RevokedClient.ClientID)
+	}
+	return fmt.Sprintf("%s:%d:%d:%d", prefix, event.ServiceID, event.ClientID, event.MessageID)
+}
+
 // dispatchIndication sends an indication to the event channel / dispatchIndication将指示发送到事件通道
 func (c *Client) dispatchIndication(p *Packet) {
 	var eventType EventType
+	var revokedClient *ClientIdentity
 
 	switch {
 	case p.ServiceType == ServiceControl && p.MessageID == CTLRevokeClientIDInd:
-		c.handleClientIDRevoke(p)
+		if identity, ok := c.handleClientIDRevoke(p); ok {
+			revokedClient = &identity
+		}
 		eventType = EventModemReset
 	case (p.ServiceType == ServiceWDS || p.ServiceType == ServiceWDSIPv6) && p.MessageID == WDSGetPktSrvcStatusInd:
 		eventType = EventPacketServiceStatusChanged
@@ -1042,30 +1065,31 @@ func (c *Client) dispatchIndication(p *Packet) {
 	}
 
 	event := Event{
-		Type:      eventType,
-		ServiceID: p.ServiceType,
-		MessageID: p.MessageID,
-		Packet:    p,
+		Type:          eventType,
+		ServiceID:     p.ServiceType,
+		ClientID:      p.ClientID,
+		MessageID:     p.MessageID,
+		Packet:        p,
+		RevokedClient: revokedClient,
 	}
 	c.enqueueIndication(event)
 }
 
-func (c *Client) handleClientIDRevoke(p *Packet) {
+func (c *Client) handleClientIDRevoke(p *Packet) (ClientIdentity, bool) {
 	if p.ServiceType != ServiceControl || p.MessageID != CTLRevokeClientIDInd {
-		return
+		return ClientIdentity{}, false
 	}
 	tlv := FindTLV(p.TLVs, 0x01)
 	if tlv == nil || len(tlv.Value) < 2 {
-		return
+		return ClientIdentity{}, false
 	}
-	service := tlv.Value[0]
-	clientID := tlv.Value[1]
+	identity := ClientIdentity{
+		ServiceID: tlv.Value[0],
+		ClientID:  tlv.Value[1],
+	}
 
-	c.mu.Lock()
-	if cached, ok := c.clientIDs[service]; ok && cached == clientID {
-		delete(c.clientIDs, service)
-	}
-	c.mu.Unlock()
+	c.deleteClientIDIfCurrent(identity.ServiceID, identity.ClientID)
+	return identity, true
 }
 
 // ============================================================================
@@ -1316,11 +1340,17 @@ func (c *Client) ReleaseClientIDWithContext(ctx context.Context, service uint8, 
 		return err
 	}
 
-	c.mu.Lock()
-	delete(c.clientIDs, service)
-	c.mu.Unlock()
+	c.deleteClientIDIfCurrent(service, clientID)
 
 	return nil
+}
+
+func (c *Client) deleteClientIDIfCurrent(service uint8, clientID uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached, ok := c.clientIDs[service]; ok && cached == clientID {
+		delete(c.clientIDs, service)
+	}
 }
 
 // GetClientID returns the cached client ID for a service, or 0 if not allocated / GetClientID返回服务的缓存客户端ID，如果未分配则返回0

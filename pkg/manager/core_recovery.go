@@ -113,6 +113,12 @@ func (m *Manager) clearRecoveryStateLocked() {
 }
 
 func (m *Manager) enqueueModemResetEvent(source string) bool {
+	return m.enqueueModemResetEventForBinding(source, nil, nil)
+}
+
+// enqueueModemResetEventForBinding records a reset only if binding still owns
+// the exact live transport. A nil binding preserves the internal/direct path.
+func (m *Manager) enqueueModemResetEventForBinding(source string, binding *listenerBinding, externalEvent *Event) bool {
 	if m == nil {
 		return false
 	}
@@ -130,11 +136,23 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 		generation == 0 ||
 		runCtx == nil ||
 		runCtx.Err() != nil
+	if binding != nil && !m.listenerBindingOwnedLocked(binding) {
+		inactive = true
+	}
 	if inactive {
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Suppress modem reset while manager is stopping")
 		return false
 	}
+	emitExternal := func() {
+		if externalEvent == nil || binding == nil || m.events == nil {
+			return
+		}
+		event := *externalEvent
+		event.Generation = generation
+		m.events.Emit(event)
+	}
+
 	request.generation = generation
 	m.modemResetMu.Lock()
 	if m.modemResetRecovering {
@@ -145,6 +163,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 		}
 		m.recoveryGeneration = generation
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Warn("Preserved modem reset indication while core recovery is running")
 		return true
@@ -155,6 +174,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	if m.modemResetEnqueued {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Coalesced duplicate modem reset indication")
 		return false
@@ -162,6 +182,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	if !m.modemResetEnqueuedAt.IsZero() && now.Sub(m.modemResetEnqueuedAt) < m.modemResetDedupWindow {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Deduplicated modem reset indication inside debounce window")
 		return false
@@ -171,6 +192,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	m.modemResetRequest = request
 	m.recoveryGeneration = generation
 	m.modemResetMu.Unlock()
+	emitExternal()
 	m.mu.RUnlock()
 
 	m.signalRecoveryEvent(eventModemReset, generation)
@@ -373,7 +395,7 @@ func (m *Manager) beginRecovery(event internalEvent) (recoveryRequest, bool) {
 }
 
 func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneration uint64) (recoveryRequest, bool) {
-	m.mu.RLock()
+	m.mu.Lock()
 	runCtx := m.ctx
 	generation := m.coreGeneration.Load()
 	active := !m.stopped &&
@@ -385,7 +407,7 @@ func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneratio
 	m.modemResetMu.Lock()
 	defer func() {
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 	}()
 
 	if m.modemResetRecovering {
@@ -436,6 +458,9 @@ func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneratio
 
 	m.modemResetRecovering = true
 	m.currentRecoveryRequest = request
+	m.coreStatusLastErr = ""
+	m.setCorePhaseLocked(CorePhaseRecovering, "recovery_begin", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 	return request, true
 }
 
@@ -478,7 +503,7 @@ func (m *Manager) finishRecoveryStateLocked(generation uint64) (internalEvent, b
 }
 
 func (m *Manager) finishRecovery() {
-	m.mu.RLock()
+	m.mu.Lock()
 	runCtx := m.ctx
 	generation := m.coreGeneration.Load()
 	active := !m.stopped &&
@@ -493,19 +518,30 @@ func (m *Manager) finishRecovery() {
 	m.modemResetMu.Lock()
 	if !m.modemResetRecovering {
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return
 	}
 	if !active || m.recoveryGeneration != generation {
 		m.clearRecoveryStateLocked()
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return
 	}
 
+	reason := string(m.currentRecoveryRequest.reason)
 	event, ok := m.finishRecoveryStateLocked(generation)
+	if ok {
+		m.setCorePhaseLocked(CorePhaseRecovering, "recovery_follow_up_queued", reason, nil)
+	} else {
+		stage := m.coreStatusStage
+		if stage == "" || stage == "recovery_begin" {
+			stage = "recovery_failed"
+		}
+		m.setCorePhaseLocked(CorePhaseDegraded, stage, reason, nil)
+	}
+	m.publishCoreStatusLocked()
 	m.modemResetMu.Unlock()
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	if ok {
 		m.signalRecoveryEvent(event, generation)

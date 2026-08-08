@@ -54,6 +54,9 @@ func (s *WDAService) Close() error {
 }
 
 func (s *WDAService) ClientID() uint8 {
+	if s == nil {
+		return 0
+	}
 	return s.clientID
 }
 
