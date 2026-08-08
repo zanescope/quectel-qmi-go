@@ -25,6 +25,9 @@ func shouldRecoverServiceError(service string, err error, serviceUnavailableText
 	if err == nil {
 		return false
 	}
+	if isUnsafeServiceOwnerError(err) {
+		return true
+	}
 
 	if errors.Is(err, qmi.ErrServiceNotSupported) {
 		return false
@@ -364,6 +367,7 @@ func withDMSRecoveryValue[T any](m *Manager, op string, fn func(dms *qmi.DMSServ
 		if m.shouldRecoverDMSError(op, err) {
 			m.logServiceRecovery("DMS", op, "initial", err, "DMS ensure failed (core recovery skipped)")
 		}
+		m.triggerCoreRecoveryForUnsafeServiceOwner("DMS", op, "ensure", err)
 		return zero, err
 	}
 
@@ -383,6 +387,7 @@ func withDMSRecoveryValue[T any](m *Manager, op string, fn func(dms *qmi.DMSServ
 	m.dmsRecoveryMu.Unlock()
 	if rebindErr != nil {
 		m.logServiceRecovery("DMS", op, "rebind", rebindErr, "DMS service rebind failed (core recovery skipped)")
+		m.triggerCoreRecoveryForUnsafeServiceOwner("DMS", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: DMS rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
 
@@ -436,14 +441,9 @@ func (m *Manager) ensureDMSService() (*qmi.DMSService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate DMS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("DMS")
+	if err := installManagedService(m, serviceSlotDMS, client, &m.dms, allocated); err != nil {
+		return nil, fmt.Errorf("publish DMS owner: %w", err)
 	}
-	m.dms = allocated
 	m.log.Info("DMS service lazily allocated")
 	return allocated, nil
 }
@@ -456,15 +456,12 @@ func (m *Manager) rebindDMSService(reason string) (*qmi.DMSService, error) {
 		return m.rebindDMSServiceHook(reason)
 	}
 
-	m.mu.Lock()
-	prev := m.dms
-	client := m.client
-	m.dms = nil
-	m.mu.Unlock()
-
+	prev, client := detachManagedService(m, serviceSlotDMS, &m.dms)
 	if prev != nil {
-		if err := prev.Close(); err != nil {
-			m.log.WithError(err).WithField("reason", reason).Warn("Closing previous DMS client failed during rebind")
+		closeErr := prev.Close()
+		if err := uncertainServiceReleaseError(serviceSlotDMS, closeErr); err != nil {
+			m.log.WithError(closeErr).WithField("reason", reason).Warn("DMS client release outcome is uncertain; refusing replacement allocation")
+			return nil, err
 		}
 	}
 	if client == nil {
@@ -475,14 +472,9 @@ func (m *Manager) rebindDMSService(reason string) (*qmi.DMSService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate DMS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("DMS")
+	if err := installManagedService(m, serviceSlotDMS, client, &m.dms, allocated); err != nil {
+		return nil, fmt.Errorf("publish DMS owner: %w", err)
 	}
-	m.dms = allocated
 	m.log.WithField("reason", reason).Info("DMS service rebound")
 	return allocated, nil
 }
@@ -551,11 +543,11 @@ func (m *Manager) ensureNASService() (*qmi.NASService, error) {
 	}
 
 	m.mu.RLock()
-	nas := m.nas
+	service := m.nas
 	client := m.client
 	m.mu.RUnlock()
-	if nas != nil {
-		return nas, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("NAS")
@@ -565,11 +557,11 @@ func (m *Manager) ensureNASService() (*qmi.NASService, error) {
 	defer m.nasRecoveryMu.Unlock()
 
 	m.mu.RLock()
-	nas = m.nas
+	service = m.nas
 	client = m.client
 	m.mu.RUnlock()
-	if nas != nil {
-		return nas, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("NAS")
@@ -579,14 +571,9 @@ func (m *Manager) ensureNASService() (*qmi.NASService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate NAS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("NAS")
+	if err := installManagedService(m, serviceSlotNAS, client, &m.nas, allocated); err != nil {
+		return nil, fmt.Errorf("publish NAS owner: %w", err)
 	}
-	m.nas = allocated
 	m.log.Info("NAS service lazily allocated")
 	return allocated, nil
 }
@@ -599,15 +586,12 @@ func (m *Manager) rebindNASService(reason string) (*qmi.NASService, error) {
 		return m.rebindNASServiceHook(reason)
 	}
 
-	m.mu.Lock()
-	prev := m.nas
-	client := m.client
-	m.nas = nil
-	m.mu.Unlock()
-
+	prev, client := detachManagedService(m, serviceSlotNAS, &m.nas)
 	if prev != nil {
-		if err := prev.Close(); err != nil {
-			m.log.WithError(err).WithField("reason", reason).Warn("Closing previous NAS client failed during rebind")
+		closeErr := prev.Close()
+		if err := uncertainServiceReleaseError(serviceSlotNAS, closeErr); err != nil {
+			m.log.WithError(closeErr).WithField("reason", reason).Warn("NAS client release outcome is uncertain; refusing replacement allocation")
+			return nil, err
 		}
 	}
 	if client == nil {
@@ -618,14 +602,9 @@ func (m *Manager) rebindNASService(reason string) (*qmi.NASService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate NAS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("NAS")
+	if err := installManagedService(m, serviceSlotNAS, client, &m.nas, allocated); err != nil {
+		return nil, fmt.Errorf("publish NAS owner: %w", err)
 	}
-	m.nas = allocated
 	m.log.WithField("reason", reason).Info("NAS service rebound")
 	return allocated, nil
 }
@@ -649,6 +628,7 @@ func withWMSRecoveryValue[T any](m *Manager, op string, fn func(wms *qmi.WMSServ
 		if m.shouldRecoverWMSError(op, err) {
 			m.logServiceRecovery("WMS", op, "initial", err, "WMS ensure failed (core recovery skipped)")
 		}
+		m.triggerCoreRecoveryForUnsafeServiceOwner("WMS", op, "ensure", err)
 		return zero, err
 	}
 
@@ -668,6 +648,7 @@ func withWMSRecoveryValue[T any](m *Manager, op string, fn func(wms *qmi.WMSServ
 	m.wmsRecoveryMu.Unlock()
 	if rebindErr != nil {
 		m.logServiceRecovery("WMS", op, "rebind", rebindErr, "WMS service rebind failed (core recovery skipped)")
+		m.triggerCoreRecoveryForUnsafeServiceOwner("WMS", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: WMS rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
 
@@ -692,11 +673,11 @@ func (m *Manager) ensureWMSService() (*qmi.WMSService, error) {
 	}
 
 	m.mu.RLock()
-	wms := m.wms
+	service := m.wms
 	client := m.client
 	m.mu.RUnlock()
-	if wms != nil {
-		return wms, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("WMS")
@@ -706,11 +687,11 @@ func (m *Manager) ensureWMSService() (*qmi.WMSService, error) {
 	defer m.wmsRecoveryMu.Unlock()
 
 	m.mu.RLock()
-	wms = m.wms
+	service = m.wms
 	client = m.client
 	m.mu.RUnlock()
-	if wms != nil {
-		return wms, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("WMS")
@@ -720,14 +701,9 @@ func (m *Manager) ensureWMSService() (*qmi.WMSService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate WMS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("WMS")
+	if err := installManagedService(m, serviceSlotWMS, client, &m.wms, allocated); err != nil {
+		return nil, fmt.Errorf("publish WMS owner: %w", err)
 	}
-	m.wms = allocated
 	m.log.Info("WMS service lazily allocated")
 	return allocated, nil
 }
@@ -744,15 +720,12 @@ func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
 		return rebound, err
 	}
 
-	m.mu.Lock()
-	prev := m.wms
-	client := m.client
-	m.wms = nil
-	m.mu.Unlock()
-
+	prev, client := detachManagedService(m, serviceSlotWMS, &m.wms)
 	if prev != nil {
-		if err := prev.Close(); err != nil {
-			m.log.WithError(err).WithField("reason", reason).Warn("Closing previous WMS client failed during rebind")
+		closeErr := prev.Close()
+		if err := uncertainServiceReleaseError(serviceSlotWMS, closeErr); err != nil {
+			m.log.WithError(closeErr).WithField("reason", reason).Warn("WMS client release outcome is uncertain; refusing replacement allocation")
+			return nil, err
 		}
 	}
 	if client == nil {
@@ -763,16 +736,9 @@ func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate WMS client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	if m.client != client {
-		m.mu.Unlock()
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("WMS")
+	if err := installManagedService(m, serviceSlotWMS, client, &m.wms, allocated); err != nil {
+		return nil, fmt.Errorf("publish WMS owner: %w", err)
 	}
-	m.wms = allocated
-	m.mu.Unlock()
-
 	m.log.WithField("reason", reason).Info("WMS service rebound")
 	m.maybeReplayWMSStateAfterRebind(reason)
 	return allocated, nil
@@ -797,6 +763,7 @@ func withVOICERecoveryValue[T any](m *Manager, op string, fn func(voice *qmi.VOI
 		if m.shouldRecoverVOICEError(op, err) {
 			m.logServiceRecovery("VOICE", op, "initial", err, "VOICE ensure failed (core recovery skipped)")
 		}
+		m.triggerCoreRecoveryForUnsafeServiceOwner("VOICE", op, "ensure", err)
 		return zero, err
 	}
 
@@ -816,6 +783,7 @@ func withVOICERecoveryValue[T any](m *Manager, op string, fn func(voice *qmi.VOI
 	m.voiceRecoveryMu.Unlock()
 	if rebindErr != nil {
 		m.logServiceRecovery("VOICE", op, "rebind", rebindErr, "VOICE service rebind failed (core recovery skipped)")
+		m.triggerCoreRecoveryForUnsafeServiceOwner("VOICE", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: VOICE rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
 
@@ -840,11 +808,11 @@ func (m *Manager) ensureVOICEService() (*qmi.VOICEService, error) {
 	}
 
 	m.mu.RLock()
-	voice := m.voice
+	service := m.voice
 	client := m.client
 	m.mu.RUnlock()
-	if voice != nil {
-		return voice, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("VOICE")
@@ -854,11 +822,11 @@ func (m *Manager) ensureVOICEService() (*qmi.VOICEService, error) {
 	defer m.voiceRecoveryMu.Unlock()
 
 	m.mu.RLock()
-	voice = m.voice
+	service = m.voice
 	client = m.client
 	m.mu.RUnlock()
-	if voice != nil {
-		return voice, nil
+	if service != nil {
+		return service, nil
 	}
 	if client == nil {
 		return nil, ErrServiceNotReady("VOICE")
@@ -868,14 +836,9 @@ func (m *Manager) ensureVOICEService() (*qmi.VOICEService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate VOICE client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("VOICE")
+	if err := installManagedService(m, serviceSlotVOICE, client, &m.voice, allocated); err != nil {
+		return nil, fmt.Errorf("publish VOICE owner: %w", err)
 	}
-	m.voice = allocated
 	m.log.Info("VOICE service lazily allocated")
 	return allocated, nil
 }
@@ -888,15 +851,12 @@ func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
 		return m.rebindVOICEServiceHook(reason)
 	}
 
-	m.mu.Lock()
-	prev := m.voice
-	client := m.client
-	m.voice = nil
-	m.mu.Unlock()
-
+	prev, client := detachManagedService(m, serviceSlotVOICE, &m.voice)
 	if prev != nil {
-		if err := prev.Close(); err != nil {
-			m.log.WithError(err).WithField("reason", reason).Warn("Closing previous VOICE client failed during rebind")
+		closeErr := prev.Close()
+		if err := uncertainServiceReleaseError(serviceSlotVOICE, closeErr); err != nil {
+			m.log.WithError(closeErr).WithField("reason", reason).Warn("VOICE client release outcome is uncertain; refusing replacement allocation")
+			return nil, err
 		}
 	}
 	if client == nil {
@@ -907,14 +867,9 @@ func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate VOICE client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("VOICE")
+	if err := installManagedService(m, serviceSlotVOICE, client, &m.voice, allocated); err != nil {
+		return nil, fmt.Errorf("publish VOICE owner: %w", err)
 	}
-	m.voice = allocated
 	m.log.WithField("reason", reason).Info("VOICE service rebound")
 	return allocated, nil
 }

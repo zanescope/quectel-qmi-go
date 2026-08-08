@@ -247,17 +247,24 @@ type Manager struct {
 
 	// Event handling
 	// Event handling / 事件处理
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	wg                    sync.WaitGroup
-	eventCh               chan internalEventEnvelope
-	listenerIndicationCh  chan listenerIndication
-	listenerBinding       *listenerBinding
-	listenerChanged       chan struct{}
-	nextListenerBindingID uint64
-	backgroundTaskMu      sync.Mutex
-	backgroundTaskWG      sync.WaitGroup
-	events                *EventEmitter // External event callbacks / 外部事件回调
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	wg                      sync.WaitGroup
+	eventCh                 chan internalEventEnvelope
+	listenerIndicationCh    chan listenerIndication
+	listenerBinding         *listenerBinding
+	listenerChanged         chan struct{}
+	nextListenerBindingID   uint64
+	serviceOwnersBySlot     map[serviceSlot]*serviceOwner
+	serviceOwnersByIdentity map[serviceIdentityKey]*serviceOwner
+	serviceOwnerTombstones  map[serviceIdentityKey]struct{}
+	serviceOwnerClient      *qmi.Client
+	serviceOwnerGeneration  uint64
+	serviceOwnerBindingID   uint64
+	nextServiceOwnerEpoch   uint64
+	backgroundTaskMu        sync.Mutex
+	backgroundTaskWG        sync.WaitGroup
+	events                  *EventEmitter // External event callbacks / 外部事件回调
 
 	// Reconnection / 重连相关
 	retryCount          int
@@ -927,6 +934,7 @@ func (m *Manager) stopOnceBody() error {
 	m.indicationDispatchMu.Lock()
 	m.mu.Lock()
 	m.modemResetMu.Lock()
+	m.revokeAllServiceOwnersLocked()
 	m.retireListenerBindingLocked(nil)
 	m.stopped = true
 	m.lifetimeActive = false
@@ -1645,53 +1653,53 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func (m *Manager) createWDSService(ctx context.Context) (*qmi.WDSService, error) {
+func (m *Manager) createWDSService(ctx context.Context, client *qmi.Client) (*qmi.WDSService, error) {
 	if m.newWDSService != nil {
-		return m.newWDSService(ctx, m.client)
+		return m.newWDSService(ctx, client)
 	}
-	return qmi.NewWDSServiceWithContext(ctx, m.client)
+	return qmi.NewWDSServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createNASService(ctx context.Context) (*qmi.NASService, error) {
+func (m *Manager) createNASService(ctx context.Context, client *qmi.Client) (*qmi.NASService, error) {
 	if m.newNASService != nil {
-		return m.newNASService(ctx, m.client)
+		return m.newNASService(ctx, client)
 	}
-	return qmi.NewNASServiceWithContext(ctx, m.client)
+	return qmi.NewNASServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createDMSService(ctx context.Context) (*qmi.DMSService, error) {
+func (m *Manager) createDMSService(ctx context.Context, client *qmi.Client) (*qmi.DMSService, error) {
 	if m.newDMSService != nil {
-		return m.newDMSService(ctx, m.client)
+		return m.newDMSService(ctx, client)
 	}
-	return qmi.NewDMSServiceWithContext(ctx, m.client)
+	return qmi.NewDMSServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createUIMService(ctx context.Context) (*qmi.UIMService, error) {
+func (m *Manager) createUIMService(ctx context.Context, client *qmi.Client) (*qmi.UIMService, error) {
 	if m.newUIMService != nil {
-		return m.newUIMService(ctx, m.client)
+		return m.newUIMService(ctx, client)
 	}
-	return qmi.NewUIMServiceWithContext(ctx, m.client)
+	return qmi.NewUIMServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createWDAService(ctx context.Context) (*qmi.WDAService, error) {
+func (m *Manager) createWDAService(ctx context.Context, client *qmi.Client) (*qmi.WDAService, error) {
 	if m.newWDAService != nil {
-		return m.newWDAService(ctx, m.client)
+		return m.newWDAService(ctx, client)
 	}
-	return qmi.NewWDAServiceWithContext(ctx, m.client)
+	return qmi.NewWDAServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createWMSService(ctx context.Context) (*qmi.WMSService, error) {
+func (m *Manager) createWMSService(ctx context.Context, client *qmi.Client) (*qmi.WMSService, error) {
 	if m.newWMSService != nil {
-		return m.newWMSService(ctx, m.client)
+		return m.newWMSService(ctx, client)
 	}
-	return qmi.NewWMSServiceWithContext(ctx, m.client)
+	return qmi.NewWMSServiceWithContext(ctx, client)
 }
 
-func (m *Manager) createVOICEService(ctx context.Context) (*qmi.VOICEService, error) {
+func (m *Manager) createVOICEService(ctx context.Context, client *qmi.Client) (*qmi.VOICEService, error) {
 	if m.newVOICEService != nil {
-		return m.newVOICEService(ctx, m.client)
+		return m.newVOICEService(ctx, client)
 	}
-	return qmi.NewVOICEServiceWithContext(ctx, m.client)
+	return qmi.NewVOICEServiceWithContext(ctx, client)
 }
 
 func (m *Manager) shouldAllocateWDA() bool {
@@ -1720,43 +1728,59 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		return ErrServiceNotReady("data-plane")
 	}
 
-	if m.cfg.EnableIPv4 && m.wds == nil {
+	m.mu.RLock()
+	client := m.client
+	wdsMissing := m.wds == nil
+	wdsV6Missing := m.wdsV6 == nil
+	wdaMissing := m.wda == nil
+	m.mu.RUnlock()
+	if client == nil {
+		return ErrServiceNotReady("data-plane")
+	}
+
+	if m.cfg.EnableIPv4 && wdsMissing {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		m.log.Debug("Allocating WDS client for IPv4...")
-		wds, err := m.createWDSService(ctx)
+		wds, err := m.createWDSService(ctx, client)
 		if err != nil {
 			return fmt.Errorf("failed to allocate WDS client: %w", err)
 		}
-		m.wds = wds
+		if err := installManagedService(m, serviceSlotWDSv4, client, &m.wds, wds); err != nil {
+			return fmt.Errorf("publish WDS IPv4 owner: %w", err)
+		}
 		m.log.Debug("Allocated WDS client for IPv4")
 	}
 
-	if m.cfg.EnableIPv6 && m.wdsV6 == nil {
+	if m.cfg.EnableIPv6 && wdsV6Missing {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		m.log.Debug("Allocating WDS client for IPv6...")
-		wdsV6, err := m.createWDSService(ctx)
+		wdsV6, err := m.createWDSService(ctx, client)
 		if err != nil {
 			return fmt.Errorf("failed to allocate IPv6 WDS client: %w", err)
 		}
-		m.wdsV6 = wdsV6
+		if err := installManagedService(m, serviceSlotWDSv6, client, &m.wdsV6, wdsV6); err != nil {
+			return fmt.Errorf("publish WDS IPv6 owner: %w", err)
+		}
 		m.log.Debug("Allocated WDS client for IPv6")
 	}
 
 	if m.shouldAllocateWDA() {
-		if m.wda == nil {
+		if wdaMissing {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			m.log.Debug("Allocating WDA client...")
-			wda, err := m.createWDAService(ctx)
+			wda, err := m.createWDAService(ctx, client)
 			if err != nil {
 				return fmt.Errorf("failed to allocate WDA client: %w", err)
 			}
-			m.wda = wda
+			if err := installManagedService(m, serviceSlotWDA, client, &m.wda, wda); err != nil {
+				return fmt.Errorf("publish WDA owner: %w", err)
+			}
 			m.rawIPConfigured.Store(false)
 			m.log.Debug("Allocated WDA client")
 		}
@@ -3608,15 +3632,16 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		{
 			run: func(taskCtx context.Context) error {
 				m.log.Debug("Allocating NAS client...")
-				nas, err := m.createNASService(taskCtx)
+				client := m.currentQMIClient()
+				nas, err := m.createNASService(taskCtx, client)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to allocate NAS client")
 					return fmt.Errorf("failed to allocate NAS client: %w", err)
 				}
+				if err := installManagedService(m, serviceSlotNAS, client, &m.nas, nas); err != nil {
+					return fmt.Errorf("publish NAS owner: %w", err)
+				}
 				m.log.Debug("Allocated NAS client")
-				m.mu.Lock()
-				m.nas = nas
-				m.mu.Unlock()
 
 				indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
 				defer cancel()
@@ -3639,30 +3664,32 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		{
 			run: func(taskCtx context.Context) error {
 				m.log.Debug("Allocating DMS client...")
-				dms, err := m.createDMSService(taskCtx)
+				client := m.currentQMIClient()
+				dms, err := m.createDMSService(taskCtx, client)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to allocate DMS client")
 					return fmt.Errorf("failed to allocate DMS client: %w", err)
 				}
+				if err := installManagedService(m, serviceSlotDMS, client, &m.dms, dms); err != nil {
+					return fmt.Errorf("publish DMS owner: %w", err)
+				}
 				m.log.Debug("Allocated DMS client")
-				m.mu.Lock()
-				m.dms = dms
-				m.mu.Unlock()
 				return nil
 			},
 		},
 		{
 			run: func(taskCtx context.Context) error {
 				m.log.Debug("Allocating UIM client...")
-				uim, err := m.createUIMService(taskCtx)
+				client := m.currentQMIClient()
+				uim, err := m.createUIMService(taskCtx, client)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to allocate UIM client")
 					return fmt.Errorf("failed to allocate UIM client: %w", err)
 				}
+				if err := installManagedService(m, serviceSlotUIM, client, &m.uim, uim); err != nil {
+					return fmt.Errorf("publish UIM owner: %w", err)
+				}
 				m.log.Debug("Allocated UIM client")
-				m.mu.Lock()
-				m.uim = uim
-				m.mu.Unlock()
 
 				indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
 				defer cancel()
@@ -3692,15 +3719,16 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 					return nil
 				}
 				m.log.Debug("Allocating WMS client...")
-				wms, err := m.createWMSService(taskCtx)
+				client := m.currentQMIClient()
+				wms, err := m.createWMSService(taskCtx, client)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to allocate WMS client")
 					return err
 				}
+				if err := installManagedService(m, serviceSlotWMS, client, &m.wms, wms); err != nil {
+					return fmt.Errorf("publish WMS owner: %w", err)
+				}
 				m.log.Debug("Allocated WMS client")
-				m.mu.Lock()
-				m.wms = wms
-				m.mu.Unlock()
 				m.recoverWMSStateWithContext(taskCtx)
 				return nil
 			},
@@ -3712,15 +3740,16 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 					return nil
 				}
 				m.log.Debug("Allocating VOICE client...")
-				voice, err := m.createVOICEService(taskCtx)
+				client := m.currentQMIClient()
+				voice, err := m.createVOICEService(taskCtx, client)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to allocate VOICE client")
 					return err
 				}
+				if err := installManagedService(m, serviceSlotVOICE, client, &m.voice, voice); err != nil {
+					return fmt.Errorf("publish VOICE owner: %w", err)
+				}
 				m.log.Debug("Allocated VOICE client")
-				m.mu.Lock()
-				m.voice = voice
-				m.mu.Unlock()
 
 				if cfg, ok := m.voiceIndicationRegistration(); ok {
 					indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
@@ -3948,6 +3977,7 @@ func (m *Manager) cleanupLocked(cleanupCtx context.Context) {
 	dms := m.dms
 	uim := m.uim
 	wda := m.wda
+	m.revokeAllServiceOwnersLocked()
 	wms := m.wms
 	ims := m.ims
 	imsa := m.imsa
@@ -4406,6 +4436,7 @@ func (m *Manager) rollbackClientAllocationAttempt(client *qmi.Client) {
 	m.imsa = nil
 	m.imsp = nil
 	m.voice = nil
+	m.revokeAllServiceOwnersLocked()
 	m.retireListenerBindingLocked(client)
 	m.client = nil
 	m.handleV4 = 0
@@ -4674,6 +4705,7 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	desiredConnection := m.desiredConnection
 	m.reconnectPending = false
 	m.reconnectGeneration = 0
+	m.revokeAllServiceOwnersLocked()
 	m.retireListenerBindingLocked(m.client)
 	generation := m.coreGeneration.Add(1)
 	request.generation = generation
@@ -5277,6 +5309,7 @@ func (m *Manager) doConnectLocked(dialCtx context.Context, generation uint64) er
 		if dialCtx.Err() != nil || !m.coreSessionCurrent(token) {
 			return ErrServiceNotReady("qmi-core")
 		}
+		m.triggerCoreRecoveryForUnsafeServiceOwner("DATA", "ensureDataPlaneServices", "publish", err)
 		m.handleDialFailure(err, generation)
 		return err
 	}
@@ -5991,7 +6024,7 @@ func (m *Manager) indicationHandler(runCtx context.Context) {
 	}
 }
 
-func (m *Manager) handleIndicationForBinding(binding *listenerBinding, evt qmi.Event) {
+func (m *Manager) handleIndicationForBinding(binding *listenerBinding, owner *serviceOwner, ownerRequired bool, evt qmi.Event) {
 	if m == nil || binding == nil {
 		return
 	}
@@ -6014,7 +6047,8 @@ func (m *Manager) handleIndicationForBinding(binding *listenerBinding, evt qmi.E
 	m.indicationDispatchMu.RLock()
 	defer m.indicationDispatchMu.RUnlock()
 	m.mu.RLock()
-	active := m.listenerBindingUsableLocked(binding)
+	active := m.listenerBindingUsableLocked(binding) &&
+		(!ownerRequired || m.serviceOwnerCurrentLocked(owner))
 	m.mu.RUnlock()
 	if active {
 		m.handleIndication(evt)

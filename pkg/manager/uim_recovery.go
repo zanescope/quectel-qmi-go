@@ -94,14 +94,9 @@ func (m *Manager) ensureUIMService() (*qmi.UIMService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate UIM client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.client != client {
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("UIM")
+	if err := installManagedService(m, serviceSlotUIM, client, &m.uim, allocated); err != nil {
+		return nil, fmt.Errorf("publish UIM owner: %w", err)
 	}
-	m.uim = allocated
 	m.log.Info("UIM service lazily allocated")
 	return allocated, nil
 }
@@ -114,15 +109,12 @@ func (m *Manager) rebindUIMService(reason string) (*qmi.UIMService, error) {
 		return m.rebindUIMServiceHook(reason)
 	}
 
-	m.mu.Lock()
-	prev := m.uim
-	client := m.client
-	m.uim = nil
-	m.mu.Unlock()
-
+	prev, client := detachManagedService(m, serviceSlotUIM, &m.uim)
 	if prev != nil {
-		if err := prev.Close(); err != nil {
-			m.log.WithError(err).WithField("reason", reason).Warn("Closing previous UIM client failed during rebind")
+		closeErr := prev.Close()
+		if err := uncertainServiceReleaseError(serviceSlotUIM, closeErr); err != nil {
+			m.log.WithError(closeErr).WithField("reason", reason).Warn("UIM client release outcome is uncertain; refusing replacement allocation")
+			return nil, err
 		}
 	}
 	if client == nil {
@@ -133,15 +125,9 @@ func (m *Manager) rebindUIMService(reason string) (*qmi.UIMService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate UIM client failed: %w", err)
 	}
-
-	m.mu.Lock()
-	if m.client != client {
-		m.mu.Unlock()
-		_ = allocated.Close()
-		return nil, ErrServiceNotReady("UIM")
+	if err := installManagedService(m, serviceSlotUIM, client, &m.uim, allocated); err != nil {
+		return nil, fmt.Errorf("publish UIM owner: %w", err)
 	}
-	m.uim = allocated
-	m.mu.Unlock()
 
 	ctx, cancel := m.opContext(m.cfg.Timeouts.IndicationRegister)
 	acceptedMask, registerErr := m.registerUIMIndicationsWithContext(ctx, allocated)
