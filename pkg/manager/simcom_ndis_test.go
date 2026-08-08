@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zanescope/quectel-qmi-go/pkg/netcfg"
+	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
 
 type fakeSIMCOMConfigurator struct {
@@ -54,6 +55,16 @@ func (f *fakeSIMCOMConfigurator) EnableRawIP(string) error {
 	return nil
 }
 
+func prepareDirectSIMCOMConnect(t *testing.T, m *Manager) {
+	t.Helper()
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.coreGeneration.Store(1)
+	m.client = &qmi.Client{}
+	m.lifetimeActive = true
+	m.coreReady = true
+	t.Cleanup(m.cancel)
+}
+
 func TestEffectiveDataCallModeDefaultsSIMCOMToNDIS(t *testing.T) {
 	m := New(Config{Device: ModemDevice{VendorID: VendorSIMCOM}}, nil)
 	if got := m.effectiveDataCallMode(); got != DataCallModeSIMCOMNDIS {
@@ -88,6 +99,7 @@ func TestSIMCOMNDISConnectRunsATDialAndDHCP(t *testing.T) {
 		EnableIPv4: true,
 		EnableIPv6: true,
 	}, nil)
+	prepareDirectSIMCOMConnect(t, m)
 	m.simcomATCommand = func(ctx context.Context, port string, command string, timeout time.Duration) (string, error) {
 		if port != "/dev/ttyUSB2" {
 			t.Fatalf("AT port=%q want /dev/ttyUSB2", port)
@@ -136,6 +148,7 @@ func TestSIMCOMNDISConnectRequiresATPort(t *testing.T) {
 		APN:        "cmnet",
 		EnableIPv4: true,
 	}, nil)
+	prepareDirectSIMCOMConnect(t, m)
 	m.desiredConnection = true
 
 	if err := m.doConnect(); err == nil {
@@ -157,6 +170,7 @@ func TestDoConnectSerializesConcurrentCalls(t *testing.T) {
 		APN:        "cmnet",
 		EnableIPv4: true,
 	}, nil)
+	prepareDirectSIMCOMConnect(t, m)
 	m.desiredConnection = true
 
 	var commandCalls atomic.Int32

@@ -62,6 +62,32 @@ const (
 	DataPlanePolicyDisabled
 )
 
+type OpenPhase string
+
+const (
+	OpenPhaseBefore OpenPhase = "before"
+	OpenPhaseAfter  OpenPhase = "after"
+)
+
+type OpenReason string
+
+const (
+	OpenReasonInitial  OpenReason = "initial"
+	OpenReasonRecovery OpenReason = "recovery"
+)
+
+// OpenAttempt describes one real QMI transport open boundary. OpenGuard is
+// called immediately before and after the low-level client is opened so an
+// embedding application can enforce host-level ownership policy on every
+// initial open, retry, and recovery reopen.
+type OpenAttempt struct {
+	Phase      OpenPhase
+	Reason     OpenReason
+	Attempt    int
+	DevicePath string
+	UseProxy   bool
+}
+
 type Config struct {
 	Device          ModemDevice // Modem device info / Modem 设备信息
 	APN             string      // APN (Access Point Name) / APN（接入点名称）
@@ -91,6 +117,11 @@ type Config struct {
 	EventPolicy     EventPolicy
 	RecoveryPolicy  RecoveryPolicy
 	ClientOptions   qmi.ClientOptions
+	// OpenGuard runs immediately before and after each low-level QMI transport
+	// open. It runs inside the manager lifecycle serialization boundary and
+	// therefore must return promptly, honor ctx cancellation, and must not call
+	// lifecycle methods on the same Manager.
+	OpenGuard func(context.Context, OpenAttempt) error
 }
 
 type TimeoutConfig struct {
@@ -150,6 +181,13 @@ type ManagerStats struct {
 // Manager - Core connection manager / 核心连接管理器
 // ============================================================================
 
+type pendingDataCall struct {
+	generation uint64
+	wds        *qmi.WDSService
+	family     uint8
+	handle     uint32
+}
+
 type Manager struct {
 	cfg Config
 	log Logger
@@ -169,41 +207,56 @@ type Manager struct {
 	voice  *qmi.VOICEService
 
 	// Connection handles / 连接句柄
-	handleV4 uint32
-	handleV6 uint32
+	handleV4         uint32
+	handleV6         uint32
+	pendingDataCalls []pendingDataCall
 
 	// State
-	mu                sync.RWMutex
-	connectMu         sync.Mutex
-	dataPlaneMu       sync.Mutex
-	rawIPConfigured   atomic.Bool
-	state             State
-	settings          *qmi.RuntimeSettings
-	controlReady      bool
-	controlReadyStage string
-	controlReadySince time.Time
-	coreReady         bool
-	coreReadyStage    string
-	coreReadyLastErr  string
-	coreReadySince    time.Time
-	desiredConnection bool
+	mu                   sync.RWMutex
+	stopOnce             sync.Once
+	stopErr              error
+	stopped              bool
+	lifecycleMu          sync.Mutex
+	timerCallbackMu      sync.Mutex
+	timerCallbackWG      sync.WaitGroup
+	timerCallbacksPaused bool
+	timerEpoch           uint64
+	connectMu            sync.Mutex
+	dataPlaneMu          sync.Mutex
+	coreGeneration       atomic.Uint64
+	rawIPConfigured      atomic.Bool
+	state                State
+	settings             *qmi.RuntimeSettings
+	lifetimeActive       bool
+	controlReady         bool
+	controlReadyStage    string
+	controlReadySince    time.Time
+	coreReady            bool
+	coreReadyStage       string
+	coreReadyLastErr     string
+	coreReadySince       time.Time
+	desiredConnection    bool
 
 	// Event handling
 	// Event handling / 事件处理
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	eventCh chan internalEvent
-	events  *EventEmitter // External event callbacks / 外部事件回调
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	eventCh          chan internalEventEnvelope
+	backgroundTaskMu sync.Mutex
+	backgroundTaskWG sync.WaitGroup
+	events           *EventEmitter // External event callbacks / 外部事件回调
 
 	// Reconnection / 重连相关
-	retryCount         int
-	retryDelays        []time.Duration
-	reinitDelays       []time.Duration
-	isRotating         bool // Flag to suppress status checks during IP rotation / 标志位: IP轮换期间抑制状态检查
-	recoverCount       int
-	recoverFirstFailAt time.Time // 本轮连续恢复失败的首次时间，用于 MaxRecoverElapsed 判据
-	lastIPCheck        time.Time
+	retryCount          int
+	retryDelays         []time.Duration
+	reinitDelays        []time.Duration
+	isRotating          bool // Flag to suppress status checks during IP rotation / 标志位: IP轮换期间抑制状态检查
+	reconnectPending    bool
+	reconnectGeneration uint64
+	recoverCount        int
+	recoverFirstFailAt  time.Time // 本轮连续恢复失败的首次时间，用于 MaxRecoverElapsed 判据
+	lastIPCheck         time.Time
 
 	// Internal notification / 内部通知
 	regNotify chan bool // For fast registration detection / 用于快速注册检测
@@ -211,34 +264,37 @@ type Manager struct {
 	// 多路拨号 (QMAP) / Multi-PDN
 	muxIface string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
 
-	timerMu                 sync.Mutex
-	scheduledTimers         map[*time.Timer]struct{}
-	targetedCheckScheduled  bool
-	postRegRefreshScheduled bool
-	postRegRefreshLastAt    time.Time
-	modemResetMu            sync.Mutex
-	modemResetRecovering    bool
-	modemResetPending       bool
-	modemResetEnqueued      bool
-	modemResetRequest       recoveryRequest
-	coreRecoveryEnqueued    bool
-	coreRecoveryRequest     recoveryRequest
-	currentRecoveryRequest  recoveryRequest
-	modemResetEnqueuedAt    time.Time
-	modemResetDedupWindow   time.Duration
-	modemResetQuietWindow   time.Duration
-	modemResetDeferred      bool
-	uimRecoveryMu           sync.Mutex
-	dmsRecoveryMu           sync.Mutex
-	nasRecoveryMu           sync.Mutex
-	wmsRecoveryMu           sync.Mutex
-	wmsReplayMu             sync.Mutex
-	voiceRecoveryMu         sync.Mutex
-	uimLastRecoverSignal    time.Time
-	uimRecoverCooldown      time.Duration
-	wmsReplayInProgress     bool
-	serviceTimeoutMu        sync.Mutex
-	serviceTimeoutFailures  map[serviceTimeoutKey]serviceTimeoutWindow
+	timerMu                  sync.Mutex
+	scheduledTimers          map[*time.Timer]struct{}
+	targetedCheckScheduled   bool
+	postRegRefreshScheduled  bool
+	postRegRefreshLastAt     time.Time
+	modemResetMu             sync.Mutex
+	modemResetRecovering     bool
+	modemResetPending        bool
+	modemResetEnqueued       bool
+	modemResetRequest        recoveryRequest
+	coreRecoveryEnqueued     bool
+	coreRecoveryRequest      recoveryRequest
+	currentRecoveryRequest   recoveryRequest
+	modemResetEnqueuedAt     time.Time
+	modemResetDedupWindow    time.Duration
+	modemResetQuietWindow    time.Duration
+	modemResetDeferred       bool
+	recoveryGeneration       uint64
+	coreRecoveryRetryPending bool
+	coreRecoveryRetryRequest recoveryRequest
+	uimRecoveryMu            sync.Mutex
+	dmsRecoveryMu            sync.Mutex
+	nasRecoveryMu            sync.Mutex
+	wmsRecoveryMu            sync.Mutex
+	wmsReplayMu              sync.Mutex
+	voiceRecoveryMu          sync.Mutex
+	uimLastRecoverSignal     time.Time
+	uimRecoverCooldown       time.Duration
+	wmsReplayInProgress      bool
+	serviceTimeoutMu         sync.Mutex
+	serviceTimeoutFailures   map[serviceTimeoutKey]serviceTimeoutWindow
 
 	globalTimeoutMu       sync.Mutex
 	globalTimeoutServices map[string]time.Time
@@ -263,6 +319,7 @@ type Manager struct {
 	wmsLastNASRegistered       bool
 	wmsLastNASRegisteredKnown  bool
 	wmsReadinessRefreshPending bool
+	wmsReadinessRefreshTicket  uint64
 
 	// Test hooks / 测试注入点
 	querySignalStrength               func(ctx context.Context) (*qmi.SignalStrength, error)
@@ -271,6 +328,16 @@ type Manager struct {
 	queryExistingPacketServiceState   func(ctx context.Context, wds *qmi.WDSService) (qmi.ConnectionStatus, error)
 	stopExistingDataCall              func(ctx context.Context, wds *qmi.WDSService) error
 	closeWDSService                   func(wds *qmi.WDSService) error
+	closeWDSServiceWithContext        func(ctx context.Context, wds *qmi.WDSService) error
+	startDataCallHook                 func(ctx context.Context, wds *qmi.WDSService, family uint8) (uint32, error)
+	stopDataCallHook                  func(ctx context.Context, wds *qmi.WDSService, handle uint32) error
+	getRotationRuntimeSettingsHook    func(ctx context.Context, wds *qmi.WDSService) (*qmi.RuntimeSettings, error)
+	flushRotationAddressesHook        func(ifname string) error
+	disconnectHostCleanupHook         func(ifname string) error
+	flushRadioDataPlaneHook           func(ifname string) error
+	configureNetworkHook              func() error
+	radioPowerCommandHook             func(ctx context.Context, token coreSessionToken, on bool, op string) error
+	stopWDSForCleanup                 func(ctx context.Context, wds *qmi.WDSService, handle uint32) error
 	simcomATCommand                   func(ctx context.Context, port string, command string, timeout time.Duration) (string, error)
 	simcomDHCP                        func(ctx context.Context, ifname string) error
 	registerWMSEventReport            func(ctx context.Context) error
@@ -307,9 +374,19 @@ type Manager struct {
 	enableRawIPHook                   func(ctx context.Context) error
 	onWMSRebindReplayHook             func(reason string)
 	openClientAndAllocateServicesHook func(context.Context) error
+	openQMIClientHook                 func(context.Context, string, qmi.ClientOptions) (*qmi.Client, error)
+	closeQMIClientHook                func(*qmi.Client) error
 	checkSIMHook                      func() error
+	checkSIMContextHook               func(context.Context) error
 	getICCIDStrictHook                func(ctx context.Context) (string, error)
 	getIMSIStrictHook                 func(ctx context.Context) (string, error)
+	beforeRecoveryCommitHook          func()
+	beforeConnectCommitHook           func()
+	recoveryEventValidatedHook        func()
+	internalEventValidatedHook        func(internalEvent, uint64)
+	finishRecoveryLockedHook          func()
+	scheduledTimerClaimedHook         func()
+	scheduledTimerBeforeClaimHook     func()
 
 	statusChecks             atomic.Uint64
 	debouncedChecks          atomic.Uint64
@@ -344,6 +421,62 @@ const (
 	eventServingSystemChanged                      // Serving system changed indication / 服务系统改变指示
 	eventModemReset                                // Modem reset indication / Modem重置指示
 	eventCoreRecovery                              // Software core recovery request / 软件 Core 恢复请求
+)
+
+// internalEventEnvelope binds queued work to the manager lifetime that
+// produced it. Consumers must validate both fields before acting; a stale
+// event must never be reinterpreted as work for a replacement QMI session.
+type internalEventEnvelope struct {
+	kind       internalEvent
+	generation uint64
+}
+
+// coreSessionToken identifies one manager lifetime and its exact transport.
+// Service-level tokens are intentionally layered separately.
+type coreSessionToken struct {
+	generation uint64
+	client     *qmi.Client
+	runCtx     context.Context
+}
+
+// coreSessionCurrentLocked requires m.mu for reading or writing.
+func (m *Manager) coreSessionCurrentLocked(token coreSessionToken) bool {
+	return token.generation != 0 &&
+		token.client != nil &&
+		token.runCtx != nil &&
+		token.runCtx.Err() == nil &&
+		!m.stopped &&
+		m.lifetimeActive &&
+		m.state != StateStopping &&
+		m.coreReady &&
+		m.coreGeneration.Load() == token.generation &&
+		m.client == token.client &&
+		m.ctx == token.runCtx
+}
+
+func (m *Manager) coreSessionCurrent(token coreSessionToken) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.coreSessionCurrentLocked(token)
+}
+
+type internalEventEnqueueResult uint8
+
+const (
+	internalEventInactive internalEventEnqueueResult = iota
+	internalEventEnqueued
+	internalEventQueueFull
+)
+
+var (
+	// ErrManagerStopped is returned after Stop establishes the manager's
+	// terminal lifecycle state. A stopped Manager cannot be restarted.
+	ErrManagerStopped = errors.New("manager has been stopped")
+
+	errInternalEventQueueFull = errors.New("internal event queue is full")
 )
 
 var defaultRetryDelays = []time.Duration{
@@ -528,7 +661,7 @@ func New(cfg Config, logger Logger) *Manager {
 		log:                   baseLog,
 		retryDelays:           append([]time.Duration(nil), cfg.RetryPolicy.ReconnectDelays...),
 		reinitDelays:          append([]time.Duration(nil), cfg.RetryPolicy.ReinitDelays...),
-		eventCh:               make(chan internalEvent, 16),
+		eventCh:               make(chan internalEventEnvelope, 16),
 		events:                NewEventEmitterWithQueueSize(cfg.EventPolicy.CallbackQueueSize),
 		scheduledTimers:       make(map[*time.Timer]struct{}),
 		modemResetDedupWindow: defaultModemResetDedupWindow,
@@ -544,10 +677,7 @@ func (m *Manager) Start() error {
 	}
 
 	if !m.cfg.NoDial {
-		m.mu.Lock()
-		m.desiredConnection = true
-		m.mu.Unlock()
-		m.eventCh <- eventStart
+		return m.requestDataConnection()
 	} else {
 		m.log.Info("NoDial mode enabled, core started without initial connection")
 	}
@@ -555,9 +685,58 @@ func (m *Manager) Start() error {
 	return nil
 }
 
+func (m *Manager) requestDataConnection() error {
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return ErrManagerStopped
+	}
+	runCtx := m.ctx
+	if !m.coreReady || m.state == StateStopping || runCtx == nil || runCtx.Err() != nil {
+		m.mu.Unlock()
+		if runCtx != nil && runCtx.Err() != nil {
+			return runCtx.Err()
+		}
+		return context.Canceled
+	}
+
+	m.desiredConnection = true
+	generation := m.coreGeneration.Load()
+	m.mu.Unlock()
+	switch m.enqueueReconnectEvent(generation) {
+	case internalEventEnqueued:
+		return nil
+	case internalEventQueueFull:
+		return nil
+	default:
+		m.mu.RLock()
+		stopped := m.stopped
+		currentCtx := m.ctx
+		m.mu.RUnlock()
+		if stopped {
+			return ErrManagerStopped
+		}
+		if currentCtx != nil && currentCtx.Err() != nil {
+			return currentCtx.Err()
+		}
+		return context.Canceled
+	}
+}
+
 // StartCore initializes the QMI core services without starting a data call.
 func (m *Manager) StartCore() error {
 	return m.StartCoreContext(context.Background())
+}
+
+// startCoreAdmissionErrorLocked requires m.mu.
+func (m *Manager) startCoreAdmissionErrorLocked() error {
+	if m.stopped {
+		return ErrManagerStopped
+	}
+	if m.lifetimeActive || m.coreReady || m.state != StateDisconnected {
+		return fmt.Errorf("manager already started")
+	}
+	return nil
 }
 
 // StartCoreContext initializes the QMI core services without starting a data call.
@@ -565,47 +744,126 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	// Reject an already active manager without disturbing its timers.
 	m.mu.Lock()
-	if m.coreReady || m.state != StateDisconnected {
+	if err := m.startCoreAdmissionErrorLocked(); err != nil {
 		m.mu.Unlock()
-		return fmt.Errorf("manager already started")
+		return err
+	}
+	m.mu.Unlock()
+
+	// Generation ownership cannot advance while a callback from the prior
+	// epoch is still executing. The helper returns with the timer gate retained
+	// so no new callback can register between the drain and the generation bump.
+	m.pauseAndDrainScheduledTimers()
+	m.mu.Lock()
+	if err := m.startCoreAdmissionErrorLocked(); err != nil {
+		m.mu.Unlock()
+		m.resumeScheduledTimersLocked()
+		return err
 	}
 	m.state = StateConnecting
 	m.desiredConnection = false
+	m.reconnectPending = false
+	m.reconnectGeneration = 0
+	runCtx, runCancel := context.WithCancel(context.Background())
+	m.ctx = runCtx
+	m.cancel = runCancel
+	m.lifetimeActive = true
+	generation := m.coreGeneration.Add(1)
 	m.mu.Unlock()
+	m.resumeScheduledTimersLocked()
+
+	operationCtx, operationCancel := context.WithCancel(ctx)
+	stopCallerCancellation := context.AfterFunc(runCtx, operationCancel)
+	defer func() {
+		stopCallerCancellation()
+		operationCancel()
+	}()
+
+	cleanupFailedStart := func() {
+		runCancel()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), m.cfg.Timeouts.Stop)
+		defer cleanupCancel()
+		m.cleanupLocked(cleanupCtx)
+		m.mu.Lock()
+		if m.coreGeneration.Load() == generation && !m.stopped {
+			m.lifetimeActive = false
+		}
+		m.mu.Unlock()
+	}
 
 	openErr := error(nil)
 	if m.openClientAndAllocateServicesHook != nil {
-		openErr = m.openClientAndAllocateServicesHook(ctx)
+		openErr = m.openClientAndAllocateServicesHook(operationCtx)
 	} else {
-		openErr = m.openClientAndAllocateServices(ctx)
+		openErr = m.openClientAndAllocateServices(operationCtx, OpenReasonInitial)
 	}
 	if openErr != nil {
-		m.cleanup()
+		cleanupFailedStart()
 		m.setState(StateDisconnected)
 		return openErr
 	}
+
+	m.mu.RLock()
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if err := operationCtx.Err(); err != nil || stopping || m.coreGeneration.Load() != generation {
+		cleanupFailedStart()
+		m.setState(StateDisconnected)
+		if err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+
 	m.mu.Lock()
 	m.markControlReadyLocked("start_control_ready")
 	m.mu.Unlock()
 
 	// Check SIM status / 检查SIM卡状态
-	if err := m.checkSIM(); err != nil {
+	if err := m.checkSIMContext(operationCtx); err != nil {
 		m.log.WithError(err).Warn("SIM check failed")
 		// Continue anyway - might work / 继续尝试，也许能工作
 	}
 
 	// Start event loop / 启动事件循环
-	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.stopScheduledTimers()
-	m.wg.Add(2)
-	go m.eventLoop()
-	go m.indicationHandler()
 
+	// Publish the running loops, readiness, and terminal startup state under the
+	// same lock Stop uses to enter StateStopping. This is the lifecycle
+	// linearization point: either startup commits first and Stop observes the
+	// WaitGroup entries, or Stop commits first and startup aborts without
+	// resurrecting readiness.
 	m.mu.Lock()
+	startErr := operationCtx.Err()
+	if startErr == nil && (m.stopped || m.state == StateStopping || m.coreGeneration.Load() != generation) {
+		startErr = context.Canceled
+	}
+	if startErr != nil {
+		m.mu.Unlock()
+		cleanupFailedStart()
+		m.setState(StateDisconnected)
+		return startErr
+	}
+
+	m.wg.Add(2)
+	go m.eventLoop(runCtx)
+	go m.indicationHandler(runCtx)
+
 	m.markCoreReadyLocked("start_core_ready")
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
 	m.mu.Unlock()
-	m.setState(StateDisconnected)
 	m.log.Info("QMI core started")
 
 	// 在底层 QMI 就绪后立即在后台异步全量加载设备标识。
@@ -616,38 +874,63 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 
 // Stop gracefully stops the connection manager / Stop 优雅停止连接管理器
 func (m *Manager) Stop() error {
+	if m == nil {
+		return nil
+	}
+	m.stopOnce.Do(func() {
+		m.stopErr = m.stopOnceBody()
+	})
+	return m.stopErr
+}
+
+func (m *Manager) stopOnceBody() error {
 	m.mu.Lock()
-	wasStopping := m.state == StateStopping
-	wasInactive := !m.coreReady && m.state == StateDisconnected
+	m.modemResetMu.Lock()
+	m.stopped = true
+	m.lifetimeActive = false
 	m.desiredConnection = false
-	if !wasStopping {
+	m.reconnectPending = false
+	m.reconnectGeneration = 0
+	if m.state != StateStopping {
 		m.state = StateStopping
 	}
+	m.clearRecoveryStateLocked()
+	m.modemResetMu.Unlock()
 	cancel := m.cancel
 	m.mu.Unlock()
 
 	m.log.Info("Stopping connection manager...")
-	m.stopScheduledTimers()
 	if cancel != nil {
 		cancel()
 	}
-
-	if !wasStopping && !wasInactive {
-		select {
-		case m.eventCh <- eventStop:
-		default:
-			m.log.Warn("Internal event queue is full while stopping; continuing shutdown")
-		}
-	}
+	m.stopScheduledTimers()
 
 	// Wait for loops to finish / 等待循环结束
 	m.wg.Wait()
 
-	m.cleanup()
+	// Join admitted background work before lifecycle cleanup. Admission is
+	// already closed by stopped=true; holding the gate linearizes Add and Wait.
+	m.backgroundTaskMu.Lock()
+	m.backgroundTaskMu.Unlock()
+	m.backgroundTaskWG.Wait()
+
+	// Event-loop work has exited. Now join any external lifecycle operation
+	// (Connect/RotateIP/recovery/startup) before closing shared QMI objects.
+	// We intentionally do not hold lifecycleMu during wg.Wait: an event already
+	// dequeued may itself need that lock in order to observe cancellation.
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	// All producers for the old lifetime are now stopped. Remove queued work
+	// before releasing resources.
+	m.drainInternalEvents()
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), m.cfg.Timeouts.Stop)
+	m.cleanupLocked(cleanupCtx)
+	cleanupCancel()
 	if m.events != nil {
 		m.events.Close()
 	}
-	m.setState(StateDisconnected)
+	m.finishStopState()
 	m.log.Info("Connection manager stopped")
 	return nil
 }
@@ -655,20 +938,21 @@ func (m *Manager) Stop() error {
 // Connect establishes a data call on top of an already-started QMI core.
 func (m *Manager) Connect() error {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return ErrManagerStopped
+	}
 	if !m.coreReady {
 		m.mu.Unlock()
 		return fmt.Errorf("manager core not started")
 	}
-	if m.state == StateStopping {
-		m.mu.Unlock()
-		return fmt.Errorf("manager is stopping")
-	}
-	if m.state == StateConnected {
+	dataReady := (m.cfg.EnableIPv4 && m.handleV4 != 0) || (!m.cfg.EnableIPv4 && m.cfg.EnableIPv6 && m.handleV6 != 0)
+	if m.state == StateConnected && dataReady {
 		m.desiredConnection = true
 		m.mu.Unlock()
 		return nil
 	}
-	if m.state == StateConnecting && (m.handleV4 != 0 || m.handleV6 != 0) {
+	if m.state == StateConnecting && dataReady {
 		m.desiredConnection = true
 		m.mu.Unlock()
 		return fmt.Errorf("connection already in progress")
@@ -691,15 +975,21 @@ func (m *Manager) Disconnect() error {
 		return fmt.Errorf("manager is stopping")
 	}
 	m.desiredConnection = false
-	hasData := m.handleV4 != 0 || m.handleV6 != 0 || m.state == StateConnected || m.state == StateConnecting
+	m.reconnectPending = false
+	m.reconnectGeneration = 0
+	hasData := m.handleV4 != 0 ||
+		m.handleV6 != 0 ||
+		len(m.pendingDataCalls) != 0 ||
+		m.isRotating ||
+		m.state == StateConnected ||
+		m.state == StateConnecting
 	m.mu.Unlock()
 
 	if !hasData {
 		return nil
 	}
 
-	m.doDisconnect()
-	return nil
+	return m.doDisconnect()
 }
 
 func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error) {
@@ -707,20 +997,57 @@ func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error)
 		ctx = context.Background()
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 
+	m.mu.RLock()
 	coreReady := m.coreReady
 	wds := m.wds
+	client := m.client
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
 
-	if !coreReady || m.client == nil {
+	if !coreReady || client == nil {
 		return false, ErrServiceNotReady("qmi-core")
+	}
+	if stopping {
+		return false, context.Canceled
+	}
+
+	operationCtx, operationCancel := contextWithLifetime(ctx, runCtx)
+	defer operationCancel()
+	if err := operationCtx.Err(); err != nil {
+		return false, err
+	}
+
+	validateSession := func() error {
+		if err := operationCtx.Err(); err != nil {
+			return err
+		}
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if m.state == StateStopping {
+			return context.Canceled
+		}
+		if !m.coreReady ||
+			m.client != client ||
+			m.ctx != runCtx ||
+			m.coreGeneration.Load() != generation {
+			return ErrServiceNotReady("qmi-core")
+		}
+		return nil
 	}
 
 	temporaryWDS := false
 	if wds == nil {
 		var err error
-		wds, err = m.createWDSService(ctx)
+		if m.newWDSService != nil {
+			wds, err = m.newWDSService(operationCtx, client)
+		} else {
+			wds, err = qmi.NewWDSServiceWithContext(operationCtx, client)
+		}
 		if err != nil {
 			return false, fmt.Errorf("allocate WDS client for existing data cleanup: %w", err)
 		}
@@ -728,40 +1055,74 @@ func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error)
 	}
 	if temporaryWDS {
 		defer func() {
-			if err := m.closeTemporaryWDSService(wds); err != nil {
+			releaseCtx, releaseCancel := contextWithMaxTimeout(runCtx, m.cfg.Timeouts.Stop)
+			defer releaseCancel()
+			if err := m.closeTemporaryWDSService(releaseCtx, wds); err != nil &&
+				!errors.Is(err, context.Canceled) {
 				m.log.WithError(err).Warn("Failed to release temporary WDS client after existing data cleanup")
 			}
 		}()
 	}
+	if err := validateSession(); err != nil {
+		return false, err
+	}
 
-	status, err := m.queryExistingPacketServiceStatus(ctx, wds)
+	status, err := m.queryExistingPacketServiceStatus(operationCtx, wds)
 	if err != nil {
 		return false, fmt.Errorf("query existing packet service status: %w", err)
+	}
+	if err := validateSession(); err != nil {
+		return false, err
 	}
 	if !packetServiceStatusHasDataCall(status) {
 		return false, nil
 	}
 
-	if err := m.stopExistingPacketDataCall(ctx, wds); err != nil {
+	if err := m.stopExistingPacketDataCall(operationCtx, wds); err != nil {
 		return false, fmt.Errorf("stop existing qmi data call: %w", err)
 	}
+	if err := validateSession(); err != nil {
+		return false, err
+	}
 
-	status, err = m.queryExistingPacketServiceStatus(ctx, wds)
+	status, err = m.queryExistingPacketServiceStatus(operationCtx, wds)
 	if err != nil {
 		return false, fmt.Errorf("verify existing packet service status after stop: %w", err)
+	}
+	if err := validateSession(); err != nil {
+		return false, err
 	}
 	if packetServiceStatusHasDataCall(status) {
 		return false, fmt.Errorf("existing qmi data call still connected after stop: %s", status.String())
 	}
 
+	m.mu.Lock()
+	if err := operationCtx.Err(); err != nil {
+		m.mu.Unlock()
+		return false, err
+	}
+	if m.state == StateStopping {
+		m.mu.Unlock()
+		return false, context.Canceled
+	}
+	if !m.coreReady ||
+		m.client != client ||
+		m.ctx != runCtx ||
+		m.coreGeneration.Load() != generation {
+		m.mu.Unlock()
+		return false, ErrServiceNotReady("qmi-core")
+	}
 	m.handleV4 = 0
 	m.handleV6 = 0
 	m.settings = nil
 	m.desiredConnection = false
+	m.reconnectPending = false
+	m.reconnectGeneration = 0
 	if m.state == StateConnected || m.state == StateConnecting {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
 	}
+	m.mu.Unlock()
 	return true, nil
 }
 
@@ -1000,6 +1361,25 @@ func (m *Manager) emitEvent(event Event) {
 	m.events.Emit(event)
 }
 
+func (m *Manager) emitEventForGeneration(event Event, generation uint64) bool {
+	if m == nil || m.events == nil || generation == 0 {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	runCtx := m.ctx
+	if m.stopped ||
+		m.state == StateStopping ||
+		m.coreGeneration.Load() != generation ||
+		runCtx == nil ||
+		runCtx.Err() != nil {
+		return false
+	}
+	event.Generation = generation
+	return m.events.Emit(event)
+}
+
 func (m *Manager) qmiIndicationEvent(eventType EventType, evt qmi.Event) Event {
 	return Event{
 		Type:       eventType,
@@ -1074,14 +1454,30 @@ func (m *Manager) getServingSystem(ctx context.Context) (*qmi.ServingSystem, err
 	})
 }
 
-func (m *Manager) getPacketServiceState(ctx context.Context) (qmi.ConnectionStatus, error) {
+func (m *Manager) packetServiceStatusTarget() (*qmi.WDSService, uint8) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cfg.EnableIPv4 {
+		return m.wds, qmi.IpFamilyV4
+	}
+	if m.cfg.EnableIPv6 {
+		return m.wdsV6, qmi.IpFamilyV6
+	}
+	// Preserve the historical IPv4 default for zero-value/test configs.
+	return m.wds, qmi.IpFamilyV4
+}
+
+func (m *Manager) getPacketServiceState(ctx context.Context) (qmi.ConnectionStatus, uint8, error) {
+	wds, family := m.packetServiceStatusTarget()
 	if m.queryPacketServiceState != nil {
-		return m.queryPacketServiceState(ctx)
+		status, err := m.queryPacketServiceState(ctx)
+		return status, family, err
 	}
-	if m.wds == nil {
-		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	if wds == nil {
+		return qmi.StatusUnknown, family, fmt.Errorf("wds service not available for IP family %d", family)
 	}
-	return m.wds.GetPacketServiceStatus(ctx)
+	status, err := wds.GetPacketServiceStatus(ctx)
+	return status, family, err
 }
 
 func packetServiceStatusHasDataCall(status qmi.ConnectionStatus) bool {
@@ -1127,20 +1523,23 @@ func isExistingDataStopNoopError(err error) bool {
 	return qmiErr.ErrorCode == qmi.QMIErrOutOfCall || qmiErr.ErrorCode == qmi.QMIErrNoEffect
 }
 
-func (m *Manager) closeTemporaryWDSService(wds *qmi.WDSService) error {
+func (m *Manager) closeTemporaryWDSService(ctx context.Context, wds *qmi.WDSService) error {
+	if m.closeWDSServiceWithContext != nil {
+		return m.closeWDSServiceWithContext(ctx, wds)
+	}
 	if m.closeWDSService != nil {
 		return m.closeWDSService(wds)
 	}
 	if wds == nil {
 		return nil
 	}
-	return wds.Close()
+	return wds.CloseWithContext(ctx)
 }
 
 func (m *Manager) opContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	base := context.Background()
 	m.mu.RLock()
-	if m.ctx != nil && m.ctx.Err() == nil {
+	if m.ctx != nil {
 		base = m.ctx
 	}
 	m.mu.RUnlock()
@@ -1149,6 +1548,39 @@ func (m *Manager) opContext(timeout time.Duration) (context.Context, context.Can
 		return context.WithCancel(base)
 	}
 	return context.WithTimeout(base, timeout)
+}
+
+// launchCoreBackgroundTask admits asynchronous work into one exact core
+// session. The worker acquires lifecycle ownership before touching services;
+// a recovery that wins the lock first makes the captured token stale.
+func (m *Manager) launchCoreBackgroundTask(fn func(context.Context, coreSessionToken)) bool {
+	if m == nil || fn == nil {
+		return false
+	}
+	m.backgroundTaskMu.Lock()
+	m.mu.RLock()
+	token := coreSessionToken{generation: m.coreGeneration.Load(), client: m.client, runCtx: m.ctx}
+	active := m.coreSessionCurrentLocked(token)
+	m.mu.RUnlock()
+	if !active {
+		m.backgroundTaskMu.Unlock()
+		return false
+	}
+	taskCtx, taskCancel := context.WithCancel(token.runCtx)
+	m.backgroundTaskWG.Add(1)
+	go func() {
+		defer m.backgroundTaskWG.Done()
+		defer taskCancel()
+
+		m.lifecycleMu.Lock()
+		defer m.lifecycleMu.Unlock()
+		if taskCtx.Err() != nil || !m.coreSessionCurrent(token) {
+			return
+		}
+		fn(taskCtx, token)
+	}()
+	m.backgroundTaskMu.Unlock()
+	return true
 }
 
 func maxDuration(a, b time.Duration) time.Duration {
@@ -1301,6 +1733,25 @@ func contextWithMaxTimeout(ctx context.Context, limit time.Duration) (context.Co
 		}
 	}
 	return context.WithTimeout(ctx, limit)
+}
+
+func contextWithLifetime(ctx context.Context, lifetime context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	operationCtx, cancel := context.WithCancel(ctx)
+	if lifetime == nil {
+		return operationCtx, cancel
+	}
+
+	stopLifetimeCancellation := context.AfterFunc(lifetime, cancel)
+	if lifetime.Err() != nil {
+		cancel()
+	}
+	return operationCtx, func() {
+		stopLifetimeCancellation()
+		cancel()
+	}
 }
 
 func copyWMSRouteConfig(cfg *qmi.WMSRouteConfig) *qmi.WMSRouteConfig {
@@ -1769,17 +2220,21 @@ func (m *Manager) maybeRefreshWMSReadiness(reason string) {
 		m.mu.Unlock()
 		return
 	}
+	m.wmsReadinessRefreshTicket++
+	ticket := m.wmsReadinessRefreshTicket
 	m.wmsReadinessRefreshPending = true
 	m.mu.Unlock()
 
-	go func() {
+	launched := m.launchCoreBackgroundTask(func(lifetimeCtx context.Context, token coreSessionToken) {
 		defer func() {
 			m.mu.Lock()
-			m.wmsReadinessRefreshPending = false
+			if m.wmsReadinessRefreshTicket == ticket {
+				m.wmsReadinessRefreshPending = false
+			}
 			m.mu.Unlock()
 		}()
 
-		ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
+		ctx, cancel := contextWithMaxTimeout(lifetimeCtx, m.cfg.Timeouts.StatusCheck)
 		defer cancel()
 		m.refreshWMSState(ctx, wmsRefreshOptions{
 			includeRoutes:    true,
@@ -1789,8 +2244,17 @@ func (m *Manager) maybeRefreshWMSReadiness(reason string) {
 			emitSummary:      true,
 			reason:           reason,
 		})
-		m.log.WithField("reason", reason).Debug("WMS readiness refresh completed")
-	}()
+		if m.coreSessionCurrent(token) {
+			m.log.WithField("reason", reason).Debug("WMS readiness refresh completed")
+		}
+	})
+	if !launched {
+		m.mu.Lock()
+		if m.wmsReadinessRefreshTicket == ticket {
+			m.wmsReadinessRefreshPending = false
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) smsReadyWithContext(ctx context.Context) (bool, bool, error) {
@@ -1888,47 +2352,252 @@ func (m *Manager) currentSMSNotReadyError() *SMSNotReadyError {
 }
 
 func (m *Manager) scheduleAfter(delay time.Duration, fn func()) {
-	wrapped := func() {
-		m.mu.RLock()
-		ctx := m.ctx
-		m.mu.RUnlock()
-		if ctx != nil && ctx.Err() != nil {
-			m.staleTimerIgnored.Add(1)
-			return
-		}
-		fn()
-	}
-	if m.afterFunc != nil {
-		m.afterFunc(delay, wrapped)
+	if m == nil || fn == nil {
 		return
 	}
+
+	// timerCallbackMu is a registration gate, not an execution lock. It makes
+	// timer registration atomic with stopScheduledTimers while still allowing a
+	// callback to schedule another timer without recursively locking a mutex.
+	m.timerCallbackMu.Lock()
+	defer m.timerCallbackMu.Unlock()
+	epoch := m.timerEpoch
+	m.mu.RLock()
+	generation := m.coreGeneration.Load()
+	scheduledCtx := m.ctx
+	active := !m.timerCallbacksPaused &&
+		!m.stopped &&
+		m.state != StateStopping &&
+		generation != 0 &&
+		scheduledCtx != nil &&
+		scheduledCtx.Err() == nil
+	m.mu.RUnlock()
+	if !active {
+		return
+	}
+
 	var timer *time.Timer
-	timer = time.AfterFunc(delay, func() {
+	wrapped := func() {
+		if m.scheduledTimerBeforeClaimHook != nil {
+			m.scheduledTimerBeforeClaimHook()
+		}
+		m.timerCallbackMu.Lock()
 		m.timerMu.Lock()
 		if timer != nil {
 			delete(m.scheduledTimers, timer)
 		}
 		m.timerMu.Unlock()
-		wrapped()
-	})
 
-	m.timerMu.Lock()
-	if m.scheduledTimers == nil {
-		m.scheduledTimers = make(map[*time.Timer]struct{})
+		m.mu.RLock()
+		currentCtx := m.ctx
+		inactive := m.timerCallbacksPaused || m.stopped || m.state == StateStopping
+		currentGeneration := m.coreGeneration.Load()
+		m.mu.RUnlock()
+		if epoch != m.timerEpoch ||
+			inactive ||
+			currentCtx != scheduledCtx ||
+			scheduledCtx.Err() != nil ||
+			generation != currentGeneration {
+			m.staleTimerIgnored.Add(1)
+			m.timerCallbackMu.Unlock()
+			return
+		}
+		// Add and stopScheduledTimers' Wait are linearized by the same gate.
+		m.timerCallbackWG.Add(1)
+		m.timerCallbackMu.Unlock()
+		defer m.timerCallbackWG.Done()
+		if m.scheduledTimerClaimedHook != nil {
+			m.scheduledTimerClaimedHook()
+		}
+		fn()
 	}
-	m.scheduledTimers[timer] = struct{}{}
-	m.timerMu.Unlock()
+	if m.afterFunc != nil {
+		timer = m.afterFunc(delay, wrapped)
+	} else {
+		timer = time.AfterFunc(delay, wrapped)
+	}
+
+	if timer != nil {
+		m.timerMu.Lock()
+		if m.scheduledTimers == nil {
+			m.scheduledTimers = make(map[*time.Timer]struct{})
+		}
+		m.scheduledTimers[timer] = struct{}{}
+		m.timerMu.Unlock()
+	}
 }
 
-func (m *Manager) stopScheduledTimers() {
+// pauseAndDrainScheduledTimers retires every unclaimed callback, waits for
+// callbacks that already claimed the current epoch, and returns with the
+// registration gate locked and callbacks paused. Generation transitions use
+// that retained lock to keep the drain and generation bump atomic.
+func (m *Manager) pauseAndDrainScheduledTimers() {
+	if m == nil {
+		return
+	}
+	m.timerCallbackMu.Lock()
+	m.timerEpoch++
+	m.timerCallbacksPaused = true
 	m.timerMu.Lock()
-	defer m.timerMu.Unlock()
 	for timer := range m.scheduledTimers {
 		timer.Stop()
 		delete(m.scheduledTimers, timer)
 	}
 	m.targetedCheckScheduled = false
 	m.postRegRefreshScheduled = false
+	m.timerMu.Unlock()
+	m.timerCallbackMu.Unlock()
+
+	// No callback can Add after paused=true was committed under the gate.
+	// A wrapper that fired before the pause is rejected by timerEpoch when it
+	// eventually acquires the gate.
+	m.timerCallbackWG.Wait()
+	m.timerCallbackMu.Lock()
+}
+
+// resumeScheduledTimersLocked releases the registration gate retained by
+// pauseAndDrainScheduledTimers. A terminal Stop leaves callbacks paused.
+func (m *Manager) resumeScheduledTimersLocked() {
+	m.mu.RLock()
+	runCtx := m.ctx
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		runCtx != nil &&
+		runCtx.Err() == nil
+	m.mu.RUnlock()
+	if active {
+		m.timerCallbacksPaused = false
+	}
+	m.timerCallbackMu.Unlock()
+}
+
+func (m *Manager) stopScheduledTimers() {
+	if m == nil {
+		return
+	}
+	m.pauseAndDrainScheduledTimers()
+	m.resumeScheduledTimersLocked()
+}
+
+// enqueueInternalEventLocked is the single producer boundary for eventCh.
+// The caller must hold m.mu for reading or writing so validation and enqueue
+// are linearized with Stop.
+func (m *Manager) enqueueInternalEventLocked(event internalEvent, generation uint64) internalEventEnqueueResult {
+	runCtx := m.ctx
+	if generation == 0 ||
+		m.stopped ||
+		m.state == StateStopping ||
+		m.coreGeneration.Load() != generation ||
+		runCtx == nil ||
+		runCtx.Err() != nil {
+		return internalEventInactive
+	}
+	if m.internalEventValidatedHook != nil {
+		m.internalEventValidatedHook(event, generation)
+	}
+	select {
+	case m.eventCh <- internalEventEnvelope{kind: event, generation: generation}:
+		return internalEventEnqueued
+	default:
+		return internalEventQueueFull
+	}
+}
+
+func (m *Manager) enqueueInternalEvent(event internalEvent, generation uint64) internalEventEnqueueResult {
+	if m == nil {
+		return internalEventInactive
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.enqueueInternalEventLocked(event, generation)
+}
+
+func (m *Manager) enqueueCurrentInternalEvent(event internalEvent) internalEventEnqueueResult {
+	if m == nil {
+		return internalEventInactive
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.enqueueInternalEventLocked(event, m.coreGeneration.Load())
+}
+
+// enqueueReconnectEvent records a generation-bound pending intent when the
+// bounded event channel is full. The event loop retries after every dequeue,
+// guaranteeing forward progress without an untracked goroutine or timer.
+func (m *Manager) enqueueReconnectEvent(generation uint64) internalEventEnqueueResult {
+	if m == nil {
+		return internalEventInactive
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.desiredConnection {
+		if m.reconnectGeneration == generation {
+			m.reconnectPending = false
+			m.reconnectGeneration = 0
+		}
+		return internalEventInactive
+	}
+	result := m.enqueueInternalEventLocked(eventStart, generation)
+	switch result {
+	case internalEventEnqueued:
+		if m.reconnectGeneration == generation {
+			m.reconnectPending = false
+			m.reconnectGeneration = 0
+		}
+	case internalEventQueueFull:
+		m.reconnectPending = true
+		m.reconnectGeneration = generation
+	default:
+		if m.reconnectGeneration == generation {
+			m.reconnectPending = false
+			m.reconnectGeneration = 0
+		}
+	}
+	return result
+}
+
+func (m *Manager) promotePendingReconnect() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.reconnectPending {
+		return
+	}
+	generation := m.reconnectGeneration
+	if !m.desiredConnection || generation == 0 || m.coreGeneration.Load() != generation {
+		m.reconnectPending = false
+		m.reconnectGeneration = 0
+		return
+	}
+	if m.enqueueInternalEventLocked(eventStart, generation) == internalEventEnqueued {
+		m.reconnectPending = false
+		m.reconnectGeneration = 0
+	}
+}
+
+func (m *Manager) consumeQueuedReconnect(envelope internalEventEnvelope) {
+	if m == nil || envelope.kind != eventStart || envelope.generation == 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.reconnectPending && m.reconnectGeneration == envelope.generation {
+		m.reconnectPending = false
+		m.reconnectGeneration = 0
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) drainInternalEvents() {
+	for {
+		select {
+		case <-m.eventCh:
+			continue
+		default:
+			return
+		}
+	}
 }
 
 func (m *Manager) scheduleTargetedCheck() {
@@ -1946,9 +2615,7 @@ func (m *Manager) scheduleTargetedCheck() {
 		m.targetedCheckScheduled = false
 		m.timerMu.Unlock()
 
-		select {
-		case m.eventCh <- eventCheckTargeted:
-		default:
+		if m.enqueueCurrentInternalEvent(eventCheckTargeted) != internalEventEnqueued {
 			m.debouncedChecks.Add(1)
 		}
 	})
@@ -2148,163 +2815,589 @@ func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err err
 	return location.mcc, location.mnc, nil
 }
 
-// RotateIP disconnects and reconnects to get a new IP address / RotateIP 断开并重新连接以获取新 IP 地址
-func (m *Manager) RotateIP() error {
+func (m *Manager) rotationSessionCurrent(token coreSessionToken, wds *qmi.WDSService) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.coreSessionCurrentLocked(token) && m.wds == wds
+}
+
+func (m *Manager) startDataCall(ctx context.Context, wds *qmi.WDSService, family uint8) (uint32, error) {
+	if m.startDataCallHook != nil {
+		return m.startDataCallHook(ctx, wds, family)
+	}
+	return wds.StartNetworkInterface(ctx,
+		m.cfg.APN, m.cfg.Username, m.cfg.Password,
+		m.cfg.AuthType, family)
+}
+
+func (m *Manager) stopDataCall(ctx context.Context, wds *qmi.WDSService, handle uint32) error {
+	if wds == nil || handle == 0 {
+		return nil
+	}
+	var err error
+	if m.stopDataCallHook != nil {
+		err = m.stopDataCallHook(ctx, wds, handle)
+	} else {
+		err = wds.StopNetworkInterface(ctx, handle)
+	}
+	if isExistingDataStopNoopError(err) {
+		return nil
+	}
+	return err
+}
+
+func (m *Manager) getRotationRuntimeSettings(ctx context.Context, wds *qmi.WDSService) (*qmi.RuntimeSettings, error) {
+	if m.getRotationRuntimeSettingsHook != nil {
+		return m.getRotationRuntimeSettingsHook(ctx, wds)
+	}
+	return wds.GetRuntimeSettings(ctx, qmi.IpFamilyV4)
+}
+
+func (m *Manager) dataInterfaceName() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.muxIface != "" {
+		return m.muxIface
+	}
+	return m.cfg.Device.NetInterface
+}
+
+func (m *Manager) flushRotationAddresses(ifname string) error {
+	if m.flushRotationAddressesHook != nil {
+		return m.flushRotationAddressesHook(ifname)
+	}
+	if strings.TrimSpace(ifname) == "" {
+		return nil
+	}
+	addressErr := netcfg.FlushAddresses(ifname)
+	routeErr := netcfg.FlushRoutes(ifname)
+	if addressErr != nil {
+		return addressErr
+	}
+	return routeErr
+}
+
+func (m *Manager) flushRadioDataPlane(ifname string) error {
+	if m.flushRadioDataPlaneHook != nil {
+		return m.flushRadioDataPlaneHook(ifname)
+	}
+	if strings.TrimSpace(ifname) == "" {
+		return nil
+	}
+	addressErr := netcfg.FlushAddresses(ifname)
+	routeErr := netcfg.FlushRoutes(ifname)
+	return errors.Join(addressErr, routeErr)
+}
+
+func pendingDataCallEqual(call pendingDataCall, generation uint64, wds *qmi.WDSService, family uint8, handle uint32) bool {
+	return call.generation == generation && call.wds == wds && call.family == family && call.handle == handle
+}
+
+// trackPendingDataCallLocked records modem ownership that could not be
+// released. m.mu must be held; no QMI operation is performed under the lock.
+func (m *Manager) trackPendingDataCallLocked(call pendingDataCall) {
+	if call.generation == 0 || call.wds == nil || call.handle == 0 {
+		return
+	}
+	for _, current := range m.pendingDataCalls {
+		if pendingDataCallEqual(current, call.generation, call.wds, call.family, call.handle) {
+			return
+		}
+	}
+	m.pendingDataCalls = append(m.pendingDataCalls, call)
+}
+
+func (m *Manager) removePendingDataCallLocked(generation uint64, wds *qmi.WDSService, family uint8, handle uint32) {
+	kept := m.pendingDataCalls[:0]
+	for _, call := range m.pendingDataCalls {
+		if pendingDataCallEqual(call, generation, wds, family, handle) {
+			continue
+		}
+		kept = append(kept, call)
+	}
+	m.pendingDataCalls = kept
+}
+
+func (m *Manager) pendingDataCallsForFamily(token coreSessionToken, family uint8) []pendingDataCall {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.coreSessionCurrentLocked(token) {
+		return nil
+	}
+	var calls []pendingDataCall
+	for _, call := range m.pendingDataCalls {
+		if call.generation == token.generation && call.family == family {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+// retryPendingDataCallsForFamily discharges old ownership before any new call
+// for the same family is started, preventing duplicate modem sessions.
+func (m *Manager) retryPendingDataCallsForFamily(ctx context.Context, token coreSessionToken, family uint8) error {
+	for _, call := range m.pendingDataCallsForFamily(token, family) {
+		if err := m.stopDataCall(ctx, call.wds, call.handle); err != nil {
+			return fmt.Errorf("release pending data call 0x%08x: %w", call.handle, err)
+		}
+		m.mu.Lock()
+		m.removePendingDataCallLocked(call.generation, call.wds, call.family, call.handle)
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+func (m *Manager) moveActiveDataCallToPendingLocked(generation uint64, wds *qmi.WDSService, family uint8, handle uint32) {
+	if m.coreGeneration.Load() != generation {
+		return
+	}
+	switch family {
+	case qmi.IpFamilyV4:
+		if m.wds == wds && m.handleV4 == handle {
+			m.handleV4 = 0
+		}
+	case qmi.IpFamilyV6:
+		if m.wdsV6 == wds && m.handleV6 == handle {
+			m.handleV6 = 0
+		}
+	}
+	m.trackPendingDataCallLocked(pendingDataCall{generation: generation, wds: wds, family: family, handle: handle})
+}
+
+// rollbackDataCallCandidate owns cleanup for a handle returned by a QMI start
+// that cannot be committed to the exact client generation. It also clears an
+// already-published matching handle after a later rotation step fails.
+func (m *Manager) rollbackDataCallCandidate(token coreSessionToken, wds *qmi.WDSService, family uint8, handle uint32) {
+	if wds == nil || handle == 0 {
+		return
+	}
+	timeout := m.cfg.Timeouts.Stop
+	if timeout <= 0 {
+		timeout = defaultTimeouts.Stop
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), timeout)
+	stopErr := m.stopDataCall(cleanupCtx, wds, handle)
+	cleanupCancel()
+	if stopErr != nil {
+		m.mu.Lock()
+		m.moveActiveDataCallToPendingLocked(token.generation, wds, family, handle)
+		m.mu.Unlock()
+		m.log.WithError(stopErr).Warn("Failed to roll back uncommitted data call")
+		return
+	}
+
 	m.mu.Lock()
+	m.removePendingDataCallLocked(token.generation, wds, family, handle)
+	if m.coreGeneration.Load() == token.generation {
+		switch family {
+		case qmi.IpFamilyV4:
+			if m.wds == wds && m.handleV4 == handle {
+				m.handleV4 = 0
+			}
+		case qmi.IpFamilyV6:
+			if m.wdsV6 == wds && m.handleV6 == handle {
+				m.handleV6 = 0
+			}
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) commitDataCallHandle(token coreSessionToken, wds *qmi.WDSService, family uint8, handle uint32) bool {
+	if wds == nil || handle == 0 {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.coreSessionCurrentLocked(token) || !m.desiredConnection {
+		return false
+	}
+	switch family {
+	case qmi.IpFamilyV4:
+		if m.wds != wds || m.handleV4 != 0 {
+			return false
+		}
+		m.handleV4 = handle
+	case qmi.IpFamilyV6:
+		if m.wdsV6 != wds || m.handleV6 != 0 {
+			return false
+		}
+		m.handleV6 = handle
+	default:
+		return false
+	}
+	m.removePendingDataCallLocked(token.generation, wds, family, handle)
+	return true
+}
+
+// dialMissingDataFamilies starts only absent legs for an exact session. This
+// lets a failed IPv4 rotation preserve a live IPv6 call without duplicating it.
+func (m *Manager) dialMissingDataFamilies(ctx context.Context, token coreSessionToken) error {
+	if ctx == nil || ctx.Err() != nil || !m.coreSessionCurrent(token) {
+		return ErrServiceNotReady("qmi-core")
+	}
+	if !m.cfg.EnableIPv4 && !m.cfg.EnableIPv6 {
+		return fmt.Errorf("no IP family enabled")
+	}
+
+	if m.cfg.EnableIPv4 {
+		m.mu.RLock()
+		wds, missing := m.wds, m.handleV4 == 0
+		m.mu.RUnlock()
+		if wds == nil {
+			return ErrServiceNotReady("WDS")
+		}
+		if err := m.retryPendingDataCallsForFamily(ctx, token, qmi.IpFamilyV4); err != nil {
+			return err
+		}
+		if missing {
+			m.log.Info("Starting IPv4 data call...")
+			handle, err := m.startDataCall(ctx, wds, qmi.IpFamilyV4)
+			if err != nil {
+				return fmt.Errorf("IPv4 dial failed: %w", err)
+			}
+			if !m.commitDataCallHandle(token, wds, qmi.IpFamilyV4, handle) {
+				m.rollbackDataCallCandidate(token, wds, qmi.IpFamilyV4, handle)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return ErrServiceNotReady("qmi-core")
+			}
+			m.log.Infof("IPv4 connected, handle=0x%08x", handle)
+		}
+	}
+
+	if m.cfg.EnableIPv6 {
+		m.mu.RLock()
+		wdsV6, missing := m.wdsV6, m.handleV6 == 0
+		m.mu.RUnlock()
+		if wdsV6 != nil {
+			if err := m.retryPendingDataCallsForFamily(ctx, token, qmi.IpFamilyV6); err != nil {
+				return err
+			}
+		}
+		if wdsV6 == nil {
+			m.mu.RLock()
+			hasV4 := m.handleV4 != 0
+			m.mu.RUnlock()
+			if !hasV4 {
+				return ErrServiceNotReady("WDS IPv6")
+			}
+		} else if missing {
+			m.log.Info("Starting IPv6 data call...")
+			handle, err := m.startDataCall(ctx, wdsV6, qmi.IpFamilyV6)
+			if err != nil {
+				m.mu.RLock()
+				hasV4 := m.handleV4 != 0
+				m.mu.RUnlock()
+				if !hasV4 {
+					return fmt.Errorf("IPv6 dial failed: %w", err)
+				}
+				m.log.WithError(err).Warn("IPv6 dial failed; continuing with IPv4")
+			} else if !m.commitDataCallHandle(token, wdsV6, qmi.IpFamilyV6, handle) {
+				m.rollbackDataCallCandidate(token, wdsV6, qmi.IpFamilyV6, handle)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return ErrServiceNotReady("qmi-core")
+			} else {
+				m.log.Infof("IPv6 connected, handle=0x%08x", handle)
+			}
+		}
+	}
+
+	m.mu.RLock()
+	current := m.coreSessionCurrentLocked(token)
+	hasV4, hasV6 := m.handleV4 != 0, m.handleV6 != 0
+	m.mu.RUnlock()
+	if !current || (m.cfg.EnableIPv4 && !hasV4) || (!m.cfg.EnableIPv4 && m.cfg.EnableIPv6 && !hasV6) {
+		return ErrServiceNotReady("data-plane")
+	}
+	return nil
+}
+
+func (m *Manager) finishIPRotation(token coreSessionToken, wds *qmi.WDSService, disrupted bool, rotationErr error) {
+	disconnected := false
+	m.mu.Lock()
+	m.isRotating = false
+	if rotationErr != nil &&
+		disrupted &&
+		m.coreSessionCurrentLocked(token) &&
+		m.wds == wds {
+		m.settings = nil
+		if m.state != StateDisconnected {
+			m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+			m.state = StateDisconnected
+		}
+		disconnected = true
+	}
+	m.mu.Unlock()
+	if !disconnected {
+		return
+	}
+	if flushErr := m.flushRotationAddresses(m.dataInterfaceName()); flushErr != nil {
+		m.log.WithError(flushErr).Warn("Failed to flush host data plane after IP rotation failure")
+	}
+	m.emitEventForGeneration(Event{Type: EventDisconnected, State: StateDisconnected, Error: rotationErr}, token.generation)
+	if m.emitReconnectingForSessionIfDesired(token, rotationErr) {
+		_ = m.enqueueReconnectEvent(token.generation)
+	}
+}
+
+func (m *Manager) emitReconnectingForSessionIfDesired(token coreSessionToken, eventErr error) bool {
+	m.mu.RLock()
+	if !m.coreSessionCurrentLocked(token) ||
+		!m.cfg.AutoReconnect ||
+		!m.desiredConnection ||
+		m.state != StateDisconnected {
+		m.mu.RUnlock()
+		return false
+	}
+	// External callbacks are best-effort. Reconnect eligibility and the
+	// internal durable intent must not depend on callback queue availability.
+	if m.events != nil {
+		_ = m.events.Emit(Event{
+			Type:       EventReconnecting,
+			Generation: token.generation,
+			State:      StateDisconnected,
+			Error:      eventErr,
+		})
+	}
+	m.mu.RUnlock()
+	return true
+}
+
+func (m *Manager) rollbackRotationHandle(token coreSessionToken, wds *qmi.WDSService, handle uint32) {
+	m.rollbackDataCallCandidate(token, wds, qmi.IpFamilyV4, handle)
+}
+
+// RotateIP disconnects and reconnects to get a new IP address / RotateIP 断开并重新连接以获取新 IP 地址
+func (m *Manager) RotateIP() (err error) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
+	m.mu.Lock()
+	if !m.cfg.EnableIPv4 {
+		m.mu.Unlock()
+		return fmt.Errorf("IPv4 is disabled, cannot rotate IPv4 address")
+	}
 	if m.state != StateConnected {
 		m.mu.Unlock()
 		return fmt.Errorf("not connected, cannot rotate IP")
 	}
+	token := coreSessionToken{generation: m.coreGeneration.Load(), client: m.client, runCtx: m.ctx}
+	if !m.coreSessionCurrentLocked(token) {
+		m.mu.Unlock()
+		return ErrServiceNotReady("qmi-core")
+	}
+	wds := m.wds
+	if wds == nil {
+		m.mu.Unlock()
+		return ErrServiceNotReady("WDS")
+	}
+	oldSettings := m.settings
+	handleV4 := m.handleV4
 	m.isRotating = true // Suppress status checks / 抑制状态检查
 	m.mu.Unlock()
+	disrupted := false
 
 	defer func() {
-		m.mu.Lock()
-		m.isRotating = false
-		m.mu.Unlock()
+		m.finishIPRotation(token, wds, disrupted, err)
 	}()
 
 	oldIP := ""
-	if m.settings != nil && m.settings.IPv4Address != nil {
-		oldIP = m.settings.IPv4Address.String()
+	if oldSettings != nil && oldSettings.IPv4Address != nil {
+		oldIP = oldSettings.IPv4Address.String()
 	}
 	m.log.Infof("Rotating IP (current: %s)...", oldIP)
 
-	ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
+	ctx, cancel := contextWithMaxTimeout(token.runCtx, m.cfg.Timeouts.Dial)
 	defer cancel()
 
 	// 1. Disconnect data call / 1. 断开数据呼叫
-	if m.handleV4 != 0 && m.wds != nil {
-		_ = m.wds.StopNetworkInterface(ctx, m.handleV4)
-		m.handleV4 = 0
+	if handleV4 != 0 {
+		if stopErr := m.stopDataCall(ctx, wds, handleV4); stopErr != nil {
+			return fmt.Errorf("stop IPv4 data call for rotation: %w", stopErr)
+		}
+		disrupted = true
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		m.mu.Lock()
+		if m.coreSessionCurrentLocked(token) && m.wds == wds && m.handleV4 == handleV4 {
+			m.handleV4 = 0
+		}
+		m.mu.Unlock()
 	}
 
 	// Flush old addresses to avoid duplicates / 清除旧地址以避免重复
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	_ = m.flushRotationAddresses(m.dataInterfaceName())
+	disrupted = true
 
 	// 3. Reconnect / 3. 重新连接
-	handle, err := m.wds.StartNetworkInterface(ctx,
-		m.cfg.APN, m.cfg.Username, m.cfg.Password,
-		m.cfg.AuthType, qmi.IpFamilyV4)
+	handle, err := m.startDataCall(ctx, wds, qmi.IpFamilyV4)
 	if err != nil {
-		return m.rotateViaRadioReset()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		return m.rotateViaRadioReset(token, wds)
+	}
+	if !m.rotationSessionCurrent(token, wds) {
+		m.rollbackRotationHandle(token, wds, handle)
+		return ErrServiceNotReady("qmi-core")
 	}
 
 	// CHECK BEFORE CONFIG: Quickly check if IP actually changed / 配置前检查: 快速检查 IP 是否真的变了
-	settings, err := m.wds.GetRuntimeSettings(ctx, qmi.IpFamilyV4)
-	if err == nil && settings.IPv4Address != nil && settings.IPv4Address.String() == oldIP {
-		m.log.Warn("IP same after redial, forcing radio reset...")
-		m.wds.StopNetworkInterface(ctx, handle)
-		return m.rotateViaRadioReset()
+	settings, err := m.getRotationRuntimeSettings(ctx, wds)
+	if ctx.Err() != nil || !m.rotationSessionCurrent(token, wds) {
+		m.rollbackRotationHandle(token, wds, handle)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrServiceNotReady("qmi-core")
 	}
-	m.handleV4 = handle
+	if err == nil && settings != nil && settings.IPv4Address != nil && settings.IPv4Address.String() == oldIP {
+		m.log.Warn("IP same after redial, forcing radio reset...")
+		m.rollbackRotationHandle(token, wds, handle)
+		return m.rotateViaRadioReset(token, wds)
+	}
+	if !m.commitDataCallHandle(token, wds, qmi.IpFamilyV4, handle) {
+		m.rollbackRotationHandle(token, wds, handle)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrServiceNotReady("qmi-core")
+	}
 
 	// 4. Reconfigure network / 4. 重新配置网络
 	if err := m.configureNetwork(); err != nil {
+		m.rollbackRotationHandle(token, wds, handle)
 		return err
 	}
 
 	// Restore connected state / 恢复已连接状态
-	m.setState(StateConnected)
+	m.mu.Lock()
+	if !m.coreSessionCurrentLocked(token) || m.wds != wds || !m.desiredConnection {
+		m.mu.Unlock()
+		m.rollbackRotationHandle(token, wds, handle)
+		return ErrServiceNotReady("qmi-core")
+	}
+	if m.state != StateConnected {
+		m.log.Infof("State: %s -> %s", m.state, StateConnected)
+		m.state = StateConnected
+	}
 	m.retryCount = 0
+	newSettings := m.settings
+	m.mu.Unlock()
 
 	newIP := ""
-	if m.settings != nil && m.settings.IPv4Address != nil {
-		newIP = m.settings.IPv4Address.String()
+	if newSettings != nil && newSettings.IPv4Address != nil {
+		newIP = newSettings.IPv4Address.String()
 	}
 
 	if oldIP == newIP {
 		m.log.Warn("IP unchanged, trying radio reset...")
-		return m.rotateViaRadioReset()
+		m.rollbackRotationHandle(token, wds, handle)
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		return m.rotateViaRadioReset(token, wds)
 	}
 
 	m.log.Infof("IP rotated: %s -> %s", oldIP, newIP)
 
 	// Emit IP change event / 5. 发送 IP 变化事件
-	m.emitEvent(Event{
+	m.emitEventForGeneration(Event{
 		Type:     EventIPChanged,
 		State:    StateConnected,
-		Settings: m.settings,
-	})
+		Settings: newSettings,
+	}, token.generation)
 
 	return nil
 }
 
 // rotateViaRadioReset performs IP rotation by resetting the radio / rotateViaRadioReset 通过重置射频执行 IP 轮换
-func (m *Manager) rotateViaRadioReset() error {
-	ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
+// lifecycleMu and connectMu must be held by the caller.
+func (m *Manager) rotateViaRadioReset(token coreSessionToken, wds *qmi.WDSService) error {
+	ctx, cancel := contextWithMaxTimeout(token.runCtx, m.cfg.Timeouts.Dial)
 	defer cancel()
 
+	if !m.rotationSessionCurrent(token, wds) {
+		return ErrServiceNotReady("qmi-core")
+	}
+	m.mu.RLock()
+	oldSettings := m.settings
+	handleV4 := m.handleV4
+	m.mu.RUnlock()
 	oldIP := ""
-	if m.settings != nil && m.settings.IPv4Address != nil {
-		oldIP = m.settings.IPv4Address.String()
+	if oldSettings != nil && oldSettings.IPv4Address != nil {
+		oldIP = oldSettings.IPv4Address.String()
 	}
 
 	// 1. Disconnect current call / 1. 断开当前呼叫
-	if m.handleV4 != 0 && m.wds != nil {
-		m.wds.StopNetworkInterface(ctx, m.handleV4)
-		m.handleV4 = 0
+	if handleV4 != 0 {
+		if stopErr := m.stopDataCall(ctx, wds, handleV4); stopErr != nil {
+			return fmt.Errorf("stop IPv4 data call before radio reset: %w", stopErr)
+		}
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		m.mu.Lock()
+		if m.coreSessionCurrentLocked(token) && m.wds == wds && m.handleV4 == handleV4 {
+			m.handleV4 = 0
+		}
+		m.mu.Unlock()
 	}
 
 	// Flush old addresses / 2. 清除旧地址
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	_ = m.flushRotationAddresses(m.dataInterfaceName())
 
-	// 2. Radio off / 3. 关闭射频
-	if err := m.withDMSRecovery("rotateViaRadioReset.RadioPowerCycle", func(dms *qmi.DMSService) error {
-		m.log.Info("Turning radio off...")
-		if powerErr := dms.RadioPower(ctx, false); powerErr != nil {
-			return powerErr
+	if _, err := m.radioPowerCycleForSession(ctx, token, "rotateViaRadioReset.RadioPowerCycle"); err != nil {
+		return fmt.Errorf("radio power cycle during IP rotation: %w", err)
+	}
+
+	// Holding lifecycleMu deliberately blocks indication side effects. Poll NAS
+	// against the exact core session instead of waiting on regNotify, which is
+	// serviced by the indication path and would deadlock behind lifecycleMu.
+	m.log.Info("Waiting for network registration (session-bound polling)...")
+	registrationDeadline := time.NewTimer(10 * time.Second)
+	registrationPoll := time.NewTicker(250 * time.Millisecond)
+	defer registrationDeadline.Stop()
+	defer registrationPoll.Stop()
+registrationLoop:
+	for {
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
 		}
-		// 3. Radio on / 4. 打开射频
-		m.log.Info("Turning radio on...")
-		if powerErr := dms.RadioPower(ctx, true); powerErr != nil {
-			return powerErr
+		registered, err := m.queryNASRegisteredWithContext(ctx)
+		if !m.rotationSessionCurrent(token, wds) {
+			return ErrServiceNotReady("qmi-core")
 		}
-		// No fixed sleep here, start polling immediately / 此处无固定睡眠，立即开始轮询
-		return nil
-	}); err != nil {
-		m.log.WithError(err).Warn("Radio power cycle failed during rotateViaRadioReset")
+		if registered {
+			break registrationLoop
+		}
+		if err != nil {
+			m.log.WithError(err).Debug("Registration poll failed during IP rotation")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-registrationDeadline.C:
+			m.log.Warn("Registration timeout, trying to connect anyway")
+			break registrationLoop
+		case <-registrationPoll.C:
+		}
 	}
-
-	// 4. Wait for registration / 5. 等待注册
-	m.mu.Lock()
-	m.regNotify = make(chan bool, 1)
-	notify := m.regNotify
-	m.mu.Unlock()
-
-	defer func() {
-		m.mu.Lock()
-		m.regNotify = nil
-		m.mu.Unlock()
-	}()
-
-	// Initial check in case we already registered / 初始检查，以防我们已经注册了
-	if registered, _ := withNASRecoveryValue(m, "rotateViaRadioReset.IsRegistered", func(nas *qmi.NASService) (bool, error) {
-		return nas.IsRegistered(ctx)
-	}); registered {
-		goto registered
-	}
-
-	m.log.Info("Waiting for network registration (via indication)...")
-	select {
-	case <-notify:
-		m.log.Debug("Received registration indication")
-	case <-time.After(10 * time.Second):
-		m.log.Warn("Registration timeout, trying to connect anyway")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-registered:
 
 	// 5. Reconnect / 6. 重新连接
-	handle, err := m.wds.StartNetworkInterface(ctx,
-		m.cfg.APN, m.cfg.Username, m.cfg.Password,
-		m.cfg.AuthType, qmi.IpFamilyV4)
-	if err != nil {
+	if err := m.dialMissingDataFamilies(ctx, token); err != nil {
 		return fmt.Errorf("redial after radio reset failed: %w", err)
 	}
-	m.handleV4 = handle
 
 	// 6. Reconfigure network / 7. 重新配置网络
 	if err := m.configureNetwork(); err != nil {
@@ -2312,22 +3405,32 @@ registered:
 	}
 
 	// Restore connected state / 恢复已连接状态
-	m.setState(StateConnected)
+	m.mu.Lock()
+	if !m.coreSessionCurrentLocked(token) || m.wds != wds || !m.desiredConnection {
+		m.mu.Unlock()
+		return ErrServiceNotReady("qmi-core")
+	}
+	if m.state != StateConnected {
+		m.log.Infof("State: %s -> %s", m.state, StateConnected)
+		m.state = StateConnected
+	}
 	m.retryCount = 0
+	newSettings := m.settings
+	m.mu.Unlock()
 
 	newIP := ""
-	if m.settings != nil && m.settings.IPv4Address != nil {
-		newIP = m.settings.IPv4Address.String()
+	if newSettings != nil && newSettings.IPv4Address != nil {
+		newIP = newSettings.IPv4Address.String()
 	}
 
 	m.log.Infof("IP rotated via radio reset: %s -> %s", oldIP, newIP)
 
 	// Emit IP change event / 8. 发送 IP 变化事件
-	m.emitEvent(Event{
+	m.emitEventForGeneration(Event{
 		Type:     EventIPChanged,
 		State:    StateConnected,
-		Settings: m.settings,
-	})
+		Settings: newSettings,
+	}, token.generation)
 
 	return nil
 }
@@ -2339,9 +3442,24 @@ registered:
 func (m *Manager) setState(s State) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// StateStopping is terminal for the current manager lifetime. Work already
+	// in flight may complete after Stop cancels the context, but it must not
+	// publish Connected/Disconnected over the shutdown state.
+	if m.stopped || (m.state == StateStopping && s != StateStopping) {
+		return
+	}
 	if m.state != s {
 		m.log.Infof("State: %s -> %s", m.state, s)
 		m.state = s
+	}
+}
+
+func (m *Manager) finishStopState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
 	}
 }
 
@@ -2395,7 +3513,10 @@ func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks 
 	}
 	wg.Wait()
 	if fatal {
-		return firstErr
+		if firstErr != nil {
+			return firstErr
+		}
+		return taskCtx.Err()
 	}
 	return nil
 }
@@ -2688,12 +3809,21 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 }
 
 func (m *Manager) checkSIM() error {
+	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
+	defer cancel()
+	return m.checkSIMContext(ctx)
+}
+
+func (m *Manager) checkSIMContext(parent context.Context) error {
+	if m != nil && m.checkSIMContextHook != nil {
+		return m.checkSIMContextHook(parent)
+	}
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
 	}
 	status := qmi.SIMAbsent
 	var err error
-	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
+	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.SIMCheck)
 	defer cancel()
 
 	// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
@@ -2735,10 +3865,20 @@ func (m *Manager) checkSIM() error {
 }
 
 func (m *Manager) cleanup() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), m.cfg.Timeouts.Stop)
+	defer cancel()
+	m.cleanupLocked(cleanupCtx)
+}
+
+func (m *Manager) cleanupLocked(cleanupCtx context.Context) {
 	// Use timeout context for cleanup operations / 使用超时上下文进行清理操作
 	m.stopScheduledTimers()
-	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
-	defer cancel()
+	if cleanupCtx == nil {
+		cleanupCtx = context.Background()
+	}
 
 	m.mu.Lock()
 	wds := m.wds
@@ -2755,6 +3895,8 @@ func (m *Manager) cleanup() {
 	client := m.client
 	handleV4 := m.handleV4
 	handleV6 := m.handleV6
+	pendingDataCalls := append([]pendingDataCall(nil), m.pendingDataCalls...)
+	m.pendingDataCalls = nil
 	ifname := m.cfg.Device.NetInterface
 
 	muxIface := m.muxIface
@@ -2796,10 +3938,11 @@ func (m *Manager) cleanup() {
 	m.wmsRoutesKnown = false
 	m.wmsLastNASRegistered = false
 	m.wmsLastNASRegisteredKnown = false
+	m.wmsReadinessRefreshTicket++
 	m.wmsReadinessRefreshPending = false
 	m.mu.Unlock()
 
-	cleanupTasks := make([]cleanupTask, 0, 4)
+	cleanupTasks := make([]cleanupTask, 0, 4+len(pendingDataCalls))
 
 	if muxIface != "" && muxID > 0 {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
@@ -2819,6 +3962,9 @@ func (m *Manager) cleanup() {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "stop-wds-v4",
 			run: func(ctx context.Context) error {
+				if m.stopWDSForCleanup != nil {
+					return m.stopWDSForCleanup(ctx, wds, handleV4)
+				}
 				return wds.StopNetworkInterface(ctx, handleV4)
 			},
 		})
@@ -2827,7 +3973,29 @@ func (m *Manager) cleanup() {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "stop-wds-v6",
 			run: func(ctx context.Context) error {
+				if m.stopWDSForCleanup != nil {
+					return m.stopWDSForCleanup(ctx, wdsV6, handleV6)
+				}
 				return wdsV6.StopNetworkInterface(ctx, handleV6)
+			},
+		})
+	}
+	for i, pending := range pendingDataCalls {
+		pending := pending
+		if pending.wds == nil || pending.handle == 0 {
+			continue
+		}
+		if (pending.family == qmi.IpFamilyV4 && pending.wds == wds && pending.handle == handleV4) ||
+			(pending.family == qmi.IpFamilyV6 && pending.wds == wdsV6 && pending.handle == handleV6) {
+			continue
+		}
+		cleanupTasks = append(cleanupTasks, cleanupTask{
+			name: fmt.Sprintf("stop-pending-wds-%d-%08x-%d", pending.family, pending.handle, i),
+			run: func(ctx context.Context) error {
+				if m.stopWDSForCleanup != nil {
+					return m.stopWDSForCleanup(ctx, pending.wds, pending.handle)
+				}
+				return pending.wds.StopNetworkInterface(ctx, pending.handle)
 			},
 		})
 	}
@@ -2848,10 +4016,18 @@ func (m *Manager) cleanup() {
 
 	// Release clients / 释放客户端
 	if wds != nil {
-		wds.Close()
+		if m.closeWDSService != nil {
+			_ = m.closeWDSService(wds)
+		} else {
+			_ = wds.Close()
+		}
 	}
 	if wdsV6 != nil {
-		wdsV6.Close()
+		if m.closeWDSService != nil {
+			_ = m.closeWDSService(wdsV6)
+		} else {
+			_ = wdsV6.Close()
+		}
 	}
 	if nas != nil {
 		nas.Close()
@@ -2882,7 +4058,7 @@ func (m *Manager) cleanup() {
 	}
 
 	if client != nil {
-		client.Close()
+		_ = m.closeQMIClient(client)
 	}
 }
 
@@ -2909,12 +4085,15 @@ func runCleanupTasks(ctx context.Context, log Logger, tasks []cleanupTask) []cle
 
 	resultCh := make(chan cleanupTaskResult, len(tasks))
 	pending := make(map[string]struct{}, len(tasks))
+	var workers sync.WaitGroup
+	workers.Add(len(tasks))
 	for i, task := range tasks {
 		if task.name == "" {
 			task.name = fmt.Sprintf("task-%d", i)
 		}
 		pending[task.name] = struct{}{}
 		go func(task cleanupTask) {
+			defer workers.Done()
 			if task.run == nil {
 				resultCh <- cleanupTaskResult{name: task.name}
 				return
@@ -2924,6 +4103,8 @@ func runCleanupTasks(ctx context.Context, log Logger, tasks []cleanupTask) []cle
 	}
 
 	results := make([]cleanupTaskResult, 0, len(tasks))
+	timedOut := make(map[string]error, len(tasks))
+	ctxDone := ctx.Done()
 	for len(pending) > 0 {
 		select {
 		case result := <-resultCh:
@@ -2931,20 +4112,25 @@ func runCleanupTasks(ctx context.Context, log Logger, tasks []cleanupTask) []cle
 				continue
 			}
 			delete(pending, result.name)
+			if timeoutErr, ok := timedOut[result.name]; ok {
+				result.err = timeoutErr
+			}
 			results = append(results, result)
 			if result.err != nil && !errors.Is(result.err, context.Canceled) {
 				log.Warnf("Cleanup task %s failed: %v", result.name, result.err)
 			}
-		case <-ctx.Done():
+		case <-ctxDone:
 			err := ctx.Err()
 			for name := range pending {
-				result := cleanupTaskResult{name: name, err: err}
-				results = append(results, result)
+				timedOut[name] = err
 				log.Warnf("Cleanup task %s timed out: %v", name, err)
 			}
-			return results
+			// Cancellation is a request for each task to unwind, not permission to
+			// orphan it. Keep draining and join every worker before transport Close.
+			ctxDone = nil
 		}
 	}
+	workers.Wait()
 	return results
 }
 
@@ -2952,7 +4138,7 @@ func runCleanupTasks(ctx context.Context, log Logger, tasks []cleanupTask) []cle
 // Event Loop / 事件循环
 // ============================================================================
 
-func (m *Manager) eventLoop() {
+func (m *Manager) eventLoop(runCtx context.Context) {
 	defer m.wg.Done()
 
 	checkTimer := time.NewTimer(jitteredFullCheckInterval(m.cfg.HealthPolicy.FullCheckInterval))
@@ -2960,26 +4146,60 @@ func (m *Manager) eventLoop() {
 
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-runCtx.Done():
 			return
 
-		case evt := <-m.eventCh:
-			m.handleEvent(evt)
+		case envelope := <-m.eventCh:
+			m.consumeQueuedReconnect(envelope)
+			m.handleInternalEventEnvelope(envelope)
+			m.promotePendingReconnect()
 
 		case <-checkTimer.C:
-			m.eventCh <- eventCheckFull
+			if m.enqueueCurrentInternalEvent(eventCheckFull) == internalEventQueueFull {
+				m.log.Warn("Internal event queue is full while scheduling full status check")
+			}
 			checkTimer.Reset(jitteredFullCheckInterval(m.cfg.HealthPolicy.FullCheckInterval))
 		}
 	}
 }
 
 func (m *Manager) handleEvent(evt internalEvent) {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	generation := m.coreGeneration.Load()
+	m.mu.RUnlock()
+	m.handleEventForGeneration(evt, generation)
+}
+
+func (m *Manager) handleInternalEventEnvelope(envelope internalEventEnvelope) {
+	if m == nil || envelope.generation == 0 {
+		return
+	}
+	m.mu.RLock()
+	runCtx := m.ctx
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		m.coreGeneration.Load() == envelope.generation &&
+		runCtx != nil &&
+		runCtx.Err() == nil
+	m.mu.RUnlock()
+	if !active {
+		return
+	}
+	m.handleEventForGeneration(envelope.kind, envelope.generation)
+}
+
+func (m *Manager) handleEventForGeneration(evt internalEvent, generation uint64) {
 	switch evt {
 	case eventStart:
-		_ = m.doConnect()
+		_ = m.doConnectForGeneration(generation)
 
 	case eventStop:
-		m.doDisconnect()
+		if err := m.doDisconnect(); err != nil {
+			m.log.WithError(err).Warn("Data disconnect event completed with cleanup errors")
+		}
 
 	case eventCheckFull:
 		m.doStatusCheck(true)
@@ -2992,7 +4212,7 @@ func (m *Manager) handleEvent(evt internalEvent) {
 		m.scheduleTargetedCheck()
 
 	case eventModemReset, eventCoreRecovery:
-		m.handleRecoveryEvent(evt)
+		m.handleRecoveryEventForGeneration(evt, generation)
 	}
 }
 
@@ -3004,8 +4224,15 @@ func (m *Manager) handleRecoveryEvent(event internalEvent) {
 	if m == nil {
 		return
 	}
+	m.handleRecoveryEventForGeneration(event, m.coreGeneration.Load())
+}
 
-	request, ok := m.beginRecovery(event)
+func (m *Manager) handleRecoveryEventForGeneration(event internalEvent, eventGeneration uint64) {
+	if m == nil {
+		return
+	}
+
+	request, ok := m.beginRecoveryForGeneration(event, eventGeneration)
 	if !ok {
 		return
 	}
@@ -3022,29 +4249,154 @@ func (m *Manager) handleRecoveryEvent(event internalEvent) {
 		entry.Warn("Core recovery requested")
 	}
 
-	recovered := m.doRecoverCore(request)
-	if recovered {
-		m.coreRecoverySuccess.Add(1)
-		m.emitEvent(Event{
-			Type:   EventCoreRecoverySucceeded,
-			State:  m.State(),
-			Reason: string(request.reason),
-		})
-	} else {
-		m.coreRecoveryFailures.Add(1)
-		m.emitEvent(Event{
-			Type:   EventCoreRecoveryFailed,
-			State:  m.State(),
-			Reason: string(request.reason),
-		})
+	result := m.doRecoverCoreAttempt(request)
+	emitTerminal := false
+	if result.terminalReason != "" && !result.finished {
+		emitTerminal = m.commitHardRecoveryTerminal(&result)
+	} else if !result.finished {
+		// Finish/promote is committed before publishing the per-attempt failure,
+		// so observers never see a terminal ordering followed by hidden work.
+		m.finishRecovery()
 	}
-
-	m.finishRecovery()
+	if !result.recovered && result.generation != 0 {
+		generation := result.generation
+		if m.emitEventForGeneration(Event{
+			Type:   EventCoreRecoveryFailed,
+			State:  StateDisconnected,
+			Reason: string(request.reason),
+		}, generation) {
+			m.coreRecoveryFailures.Add(1)
+		}
+	}
+	// A terminal event is the final recovery event for this attempt. Consumers
+	// may safely tear down their recovery state as soon as they observe it.
+	if emitTerminal {
+		m.emitRecoveryTerminal(result)
+	}
 }
 
-func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
+func (m *Manager) runOpenGuard(ctx context.Context, attempt OpenAttempt) error {
+	if m.cfg.OpenGuard == nil {
+		return nil
+	}
+	if err := m.cfg.OpenGuard(ctx, attempt); err != nil {
+		return fmt.Errorf(
+			"qmi open guard rejected %s phase for %s open attempt %d: %w",
+			attempt.Phase, attempt.Reason, attempt.Attempt, err,
+		)
+	}
+	return nil
+}
+
+func (m *Manager) openQMIClient(ctx context.Context) (*qmi.Client, error) {
+	if m.openQMIClientHook != nil {
+		return m.openQMIClientHook(ctx, m.cfg.Device.ControlPath, m.cfg.ClientOptions)
+	}
+	return qmi.NewClientWithOptions(ctx, m.cfg.Device.ControlPath, m.cfg.ClientOptions)
+}
+
+func (m *Manager) closeQMIClient(client *qmi.Client) error {
+	if client == nil {
+		return nil
+	}
+	if m.closeQMIClientHook != nil {
+		return m.closeQMIClientHook(client)
+	}
+	return client.Close()
+}
+
+// rollbackClientAllocationAttempt detaches every service that could have been
+// published by allocateServices for client, then releases service client IDs
+// before closing the transport. The caller owns lifecycle serialization and
+// allocateServices has already joined its startup tasks.
+func (m *Manager) rollbackClientAllocationAttempt(client *qmi.Client) {
+	if client == nil {
+		return
+	}
+
+	m.mu.Lock()
+	if m.client != client {
+		m.mu.Unlock()
+		_ = m.closeQMIClient(client)
+		return
+	}
+	wds := m.wds
+	wdsV6 := m.wdsV6
+	nas := m.nas
+	dms := m.dms
+	uim := m.uim
+	wda := m.wda
+	wms := m.wms
+	ims := m.ims
+	imsa := m.imsa
+	imsp := m.imsp
+	voice := m.voice
+	m.wds = nil
+	m.wdsV6 = nil
+	m.nas = nil
+	m.dms = nil
+	m.uim = nil
+	m.wda = nil
+	m.wms = nil
+	m.ims = nil
+	m.imsa = nil
+	m.imsp = nil
+	m.voice = nil
+	m.client = nil
+	m.handleV4 = 0
+	m.handleV6 = 0
+	m.settings = nil
+	m.rawIPConfigured.Store(false)
+	m.mu.Unlock()
+
+	timeout := m.cfg.Timeouts.Stop
+	if timeout <= 0 {
+		timeout = defaultTimeouts.Stop
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), timeout)
+	defer cleanupCancel()
+	if wds != nil {
+		_ = m.closeTemporaryWDSService(cleanupCtx, wds)
+	}
+	if wdsV6 != nil {
+		_ = m.closeTemporaryWDSService(cleanupCtx, wdsV6)
+	}
+	if nas != nil {
+		_ = nas.Close()
+	}
+	if dms != nil {
+		_ = dms.Close()
+	}
+	if uim != nil {
+		_ = uim.Close()
+	}
+	if wda != nil {
+		_ = wda.Close()
+	}
+	if wms != nil {
+		_ = wms.Close()
+	}
+	if ims != nil {
+		_ = ims.Close()
+	}
+	if imsa != nil {
+		_ = imsa.Close()
+	}
+	if imsp != nil {
+		_ = imsp.Close()
+	}
+	if voice != nil {
+		_ = voice.Close()
+	}
+	_ = m.closeQMIClient(client)
+}
+
+func (m *Manager) openClientAndAllocateServices(ctx context.Context, reason OpenReason) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if reason == "" {
+		reason = OpenReasonInitial
 	}
 	const maxAttempts = 4
 	var lastErr error
@@ -3054,28 +4406,52 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 			return err
 		}
 		initCtx, cancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.Init)
-		client, err := qmi.NewClientWithOptions(initCtx, m.cfg.Device.ControlPath, m.cfg.ClientOptions)
+		openAttempt := OpenAttempt{
+			Phase:      OpenPhaseBefore,
+			Reason:     reason,
+			Attempt:    attempt,
+			DevicePath: m.cfg.Device.ControlPath,
+			UseProxy:   m.cfg.ClientOptions.UseProxy,
+		}
+		if err := m.runOpenGuard(initCtx, openAttempt); err != nil {
+			cancel()
+			return err
+		}
+
+		client, err := m.openQMIClient(initCtx)
 		if err != nil {
 			cancel()
 			lastErr = fmt.Errorf("failed to open QMI device: %w", err)
 		} else {
+			openAttempt.UseProxy = client.UsesProxy()
+			openAttempt.Phase = OpenPhaseAfter
+			if guardErr := m.runOpenGuard(initCtx, openAttempt); guardErr != nil {
+				_ = m.closeQMIClient(client)
+				cancel()
+				return guardErr
+			}
+			if err := initCtx.Err(); err != nil {
+				_ = m.closeQMIClient(client)
+				cancel()
+				return err
+			}
+
 			m.mu.Lock()
 			m.client = client
 			m.mu.Unlock()
 
 			err = m.allocateServices(initCtx)
-			cancel()
 			if err == nil {
+				err = initCtx.Err()
+			}
+			if err == nil {
+				cancel()
 				return nil
 			}
 			lastErr = err
 
-			client.Close()
-			m.mu.Lock()
-			if m.client == client {
-				m.client = nil
-			}
-			m.mu.Unlock()
+			m.rollbackClientAllocationAttempt(client)
+			cancel()
 		}
 
 		var timeoutErr *qmi.TimeoutError
@@ -3104,60 +4480,200 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 }
 
 func (m *Manager) doRecoverFromModemReset() bool {
-	return m.doRecoverCore(modemResetRecoveryRequest("direct"))
+	request := modemResetRecoveryRequest("direct")
+	m.mu.RLock()
+	request.generation = m.coreGeneration.Load()
+	m.mu.RUnlock()
+	result := m.doRecoverCoreAttempt(request)
+	m.emitRecoveryTerminal(result)
+	return result.recovered
+}
+
+type recoveryAttemptResult struct {
+	recovered      bool
+	finished       bool
+	generation     uint64
+	terminalReason string
+	terminalErr    error
+}
+
+// commitHardRecoveryTerminal atomically retires all pending recovery work for
+// an exhausted/device-removed attempt. A hard terminal event is emitted only
+// after this commit, so no pending reset or preserved retry can be promoted
+// after observers have been told recovery is terminal.
+func (m *Manager) commitHardRecoveryTerminal(result *recoveryAttemptResult) bool {
+	if m == nil || result == nil || result.finished || result.terminalReason == "" || result.generation == 0 {
+		return false
+	}
+	m.mu.Lock()
+	runCtx := m.ctx
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		m.coreGeneration.Load() == result.generation &&
+		runCtx != nil &&
+		runCtx.Err() == nil
+	if !active {
+		m.mu.Unlock()
+		return false
+	}
+	m.modemResetMu.Lock()
+	if !m.modemResetRecovering || m.recoveryGeneration != result.generation {
+		m.modemResetMu.Unlock()
+		m.mu.Unlock()
+		return false
+	}
+	m.clearRecoveryStateLocked()
+	result.finished = true
+	m.modemResetMu.Unlock()
+	m.mu.Unlock()
+	return true
+}
+
+func (m *Manager) emitRecoveryTerminal(result recoveryAttemptResult) bool {
+	if result.terminalReason == "" || result.generation == 0 {
+		return false
+	}
+	return m.emitEventForGeneration(Event{
+		Type:   EventRecoveryExhausted,
+		State:  StateDisconnected,
+		Error:  result.terminalErr,
+		Reason: result.terminalReason,
+	}, result.generation)
 }
 
 func (m *Manager) doRecoverCore(request recoveryRequest) bool {
-	m.mu.RLock()
-	desiredConnection := m.desiredConnection
-	isStopping := m.state == StateStopping
-	m.mu.RUnlock()
-	if isStopping {
-		return false
+	return m.doRecoverCoreAttempt(request).recovered
+}
+
+func (m *Manager) doRecoverCoreAttempt(request recoveryRequest) recoveryAttemptResult {
+	recoveryCtx, recoveryCancel := m.opContext(0)
+	defer recoveryCancel()
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	return m.doRecoverCoreLocked(recoveryCtx, request)
+}
+
+func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryRequest) (result recoveryAttemptResult) {
+	if ctx == nil || ctx.Err() != nil {
+		return result
 	}
 
-	m.recoverAttempts.Add(1)
-	m.doDisconnect()
-	m.cleanup()
-	m.snapshot.Reset()
+	// Avoid retiring live timers for an already stale request, then drain the
+	// exact active epoch before advancing core ownership. The second validation
+	// closes the race with Stop while the drain was in progress.
+	m.mu.RLock()
+	currentGeneration := m.coreGeneration.Load()
+	preflight := ctx.Err() == nil &&
+		!m.stopped &&
+		m.state != StateStopping &&
+		request.generation != 0 &&
+		currentGeneration != 0 &&
+		request.generation == currentGeneration
+	m.mu.RUnlock()
+	if !preflight {
+		return result
+	}
+
+	m.pauseAndDrainScheduledTimers()
 	m.mu.Lock()
-	m.markControlNotReadyLocked("recover_reinit_services")
-	m.markCoreNotReadyLocked("recover_reinit_services", nil)
+	currentGeneration = m.coreGeneration.Load()
+	if ctx.Err() != nil ||
+		m.stopped ||
+		m.state == StateStopping ||
+		request.generation == 0 ||
+		currentGeneration == 0 ||
+		request.generation != currentGeneration {
+		m.mu.Unlock()
+		m.resumeScheduledTimersLocked()
+		return result
+	}
+	desiredConnection := m.desiredConnection
+	m.reconnectPending = false
+	m.reconnectGeneration = 0
+	generation := m.coreGeneration.Add(1)
+	request.generation = generation
+	result.generation = generation
+	// Advancing the authoritative generation and withdrawing readiness are one
+	// state commit. Observers can never see a fresh generation advertised as
+	// ready while it still owns the retired client and services.
+	m.markControlNotReadyLocked("recover_generation_advanced")
+	m.markCoreNotReadyLocked("recover_generation_advanced", nil)
+
+	// A reset can arrive after beginRecovery marks the current recovery active
+	// but before this session generation is advanced. Move the active recovery
+	// bookkeeping to the new generation while m.mu excludes new enqueues, so a
+	// real pending reset is not discarded as stale by finishRecovery.
+	m.modemResetMu.Lock()
+	if m.modemResetRecovering && m.recoveryGeneration == currentGeneration {
+		m.recoveryGeneration = generation
+		m.currentRecoveryRequest = request
+	}
+	m.modemResetMu.Unlock()
+
 	m.mu.Unlock()
+	m.resumeScheduledTimersLocked()
+
+	m.recoverAttempts.Add(1)
+
+	disconnectCtx, disconnectCancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.Stop)
+	if disconnectErr := m.doDisconnectLocked(disconnectCtx); disconnectErr != nil {
+		m.log.WithError(disconnectErr).Warn("Data disconnect was incomplete before core recovery cleanup")
+	}
+	disconnectCancel()
+
+	cleanupCtx, cleanupCancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.Stop)
+	m.cleanupLocked(cleanupCtx)
+	cleanupCancel()
+	m.snapshot.Reset()
 
 	openErr := error(nil)
 	if m.openClientAndAllocateServicesHook != nil {
-		openErr = m.openClientAndAllocateServicesHook(context.Background())
+		openErr = m.openClientAndAllocateServicesHook(ctx)
 	} else {
-		openErr = m.openClientAndAllocateServices(context.Background())
+		openErr = m.openClientAndAllocateServices(ctx, OpenReasonRecovery)
 	}
 	if openErr != nil {
 		m.log.WithError(openErr).Warn("Failed to reinitialize QMI core during recovery")
 		m.mu.Lock()
 		m.markControlNotReadyLocked("recover_reinit_services")
 		m.markCoreNotReadyLocked("recover_reinit_services", openErr)
+		isStopping := m.state == StateStopping
 		m.mu.Unlock()
 		m.setState(StateDisconnected)
+		if ctx.Err() != nil || isStopping {
+			return result
+		}
 		if m.isControlDeviceGone() {
-			m.log.WithError(openErr).Warn("Control device node missing; emitting device_removed terminal event")
+			m.log.WithError(openErr).Warn("Control device node missing; terminating recovery retries")
 			m.recoverCount = 0
 			m.recoverFirstFailAt = time.Time{}
-			m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Error: openErr, Reason: "device_removed"})
-			return false
+			result.terminalReason, result.terminalErr = "device_removed", openErr
+			return result
 		}
-		m.scheduleRecoverRetryFor(request, "reinit_failed")
-		return false
+		retryResult := m.scheduleRecoverRetryFor(request, "reinit_failed")
+		if retryResult.terminalReason != "" {
+			result.terminalReason = retryResult.terminalReason
+		}
+		return result
 	}
+	m.mu.RLock()
+	isStopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if ctx.Err() != nil || isStopping {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), m.cfg.Timeouts.Stop)
+		m.cleanupLocked(cleanupCtx)
+		cleanupCancel()
+		m.setState(StateDisconnected)
+		return result
+	}
+
 	m.mu.Lock()
 	m.markControlReadyLocked("recover_control_ready")
 	m.mu.Unlock()
 
-	checkSIMErr := error(nil)
-	if m.checkSIMHook != nil {
-		checkSIMErr = m.checkSIMHook()
-	} else {
-		checkSIMErr = m.checkSIM()
-	}
+	checkSIMErr := m.checkSIMContext(ctx)
 	if checkSIMErr != nil {
 		m.log.WithError(checkSIMErr).Warn("SIM check failed after core recovery")
 	}
@@ -3165,7 +4681,7 @@ func (m *Manager) doRecoverCore(request recoveryRequest) bool {
 	m.mu.Lock()
 	m.markCoreNotReadyLocked("recover_wait_reset_quiet", nil)
 	m.mu.Unlock()
-	quietCtx, quietCancel := m.opContext(m.modemResetQuietWindow + time.Second)
+	quietCtx, quietCancel := contextWithMaxTimeout(ctx, m.modemResetQuietWindow+time.Second)
 	quietErr := m.waitResetQuietWindow(quietCtx)
 	quietCancel()
 	if quietErr != nil {
@@ -3173,10 +4689,19 @@ func (m *Manager) doRecoverCore(request recoveryRequest) bool {
 		m.markCoreNotReadyLocked("recover_wait_reset_quiet", quietErr)
 		m.mu.Unlock()
 		m.log.WithError(quietErr).Warn("QMI reset quiet-window gate not satisfied")
-		if !m.hasPendingModemReset() {
-			m.scheduleRecoverRetryFor(request, "quiet_window")
+		m.mu.RLock()
+		stopping := m.state == StateStopping
+		m.mu.RUnlock()
+		if ctx.Err() != nil || stopping {
+			return result
 		}
-		return false
+		if !m.hasPendingModemReset() {
+			retryResult := m.scheduleRecoverRetryFor(request, "quiet_window")
+			if retryResult.terminalReason != "" {
+				result.terminalReason = retryResult.terminalReason
+			}
+		}
+		return result
 	}
 
 	m.mu.Lock()
@@ -3186,31 +4711,81 @@ func (m *Manager) doRecoverCore(request recoveryRequest) bool {
 	if identityTimeout <= 0 {
 		identityTimeout = defaultTimeouts.SIMCheck
 	}
-	identityCtx, identityCancel := m.opContext(identityTimeout)
+	identityCtx, identityCancel := contextWithMaxTimeout(ctx, identityTimeout)
 	identityErr := m.waitIdentityReadable(identityCtx)
 	identityCancel()
 	if identityErr != nil {
 		m.log.WithError(identityErr).Warn("QMI identity gate not satisfied after reset recovery (core recovery proceeds anyway)")
 	}
 
-	m.recoverCount = 0
-	m.recoverFirstFailAt = time.Time{}
-	m.recoverBackoffMs.Store(0)
-	m.recoverSuccess.Add(1)
+	if m.beforeRecoveryCommitHook != nil {
+		m.beforeRecoveryCommitHook()
+	}
 
 	m.mu.Lock()
+	m.modemResetMu.Lock()
+	pendingReset := m.modemResetRecovering &&
+		m.recoveryGeneration == generation &&
+		m.modemResetPending
+	staleRecovery := m.modemResetRecovering &&
+		m.recoveryGeneration != generation
+	if ctx.Err() != nil ||
+		m.stopped ||
+		m.state == StateStopping ||
+		m.coreGeneration.Load() != generation ||
+		staleRecovery {
+		m.modemResetMu.Unlock()
+		m.mu.Unlock()
+		return result
+	}
+	if pendingReset {
+		event, queued := m.finishRecoveryStateLocked(generation)
+		result.finished = true
+		m.modemResetMu.Unlock()
+		m.mu.Unlock()
+		if queued {
+			m.signalRecoveryEvent(event, generation)
+		}
+		return result
+	}
+	m.recoverCount = 0
+	m.recoverFirstFailAt = time.Time{}
 	m.markCoreReadyLocked("recover_converged")
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
+	m.recoverBackoffMs.Store(0)
+	m.recoverSuccess.Add(1)
+	m.coreRecoverySuccess.Add(1)
+	if m.events != nil {
+		m.events.Emit(Event{
+			Type:       EventCoreRecoverySucceeded,
+			Generation: generation,
+			State:      StateDisconnected,
+			Reason:     string(request.reason),
+		})
+	}
+	nextEvent, followUpQueued := m.finishRecoveryStateLocked(generation)
+	result.finished = true
+	m.modemResetMu.Unlock()
 	m.mu.Unlock()
-	m.setState(StateDisconnected)
+
+	if followUpQueued {
+		m.signalRecoveryEvent(nextEvent, generation)
+	}
 	if desiredConnection && m.cfg.AutoReconnect {
 		m.scheduleAfter(2*time.Second, func() {
-			m.eventCh <- eventStart
+			if m.enqueueReconnectEvent(generation) == internalEventQueueFull {
+				m.log.Warn("Internal event queue is full while scheduling recovery reconnect")
+			}
 		})
 	} else {
 		m.log.Info("QMI core recovered without reconnecting data plane")
 	}
 
-	return true
+	result.recovered = true
+	return result
 }
 
 func (m *Manager) hasPendingModemReset() bool {
@@ -3307,15 +4882,42 @@ func (m *Manager) recoveryExhausted() bool {
 	return false
 }
 
+type recoveryRetryResult struct {
+	terminalReason string
+	generation     uint64
+}
+
 func (m *Manager) scheduleRecoverRetry(reason string) {
 	request := m.currentRecovery()
 	if request.reason == "" {
 		request = explicitRecoveryRequest("recover_retry")
 	}
-	m.scheduleRecoverRetryFor(request, reason)
+	if request.generation == 0 {
+		m.mu.RLock()
+		request.generation = m.coreGeneration.Load()
+		m.mu.RUnlock()
+	}
+	result := m.scheduleRecoverRetryFor(request, reason)
+	if result.terminalReason != "" {
+		m.emitEventForGeneration(Event{
+			Type:   EventRecoveryExhausted,
+			State:  StateDisconnected,
+			Reason: result.terminalReason,
+		}, result.generation)
+	}
 }
 
-func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string) {
+func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string) recoveryRetryResult {
+	m.mu.RLock()
+	generation := m.coreGeneration.Load()
+	runCtx := m.ctx
+	active := !m.stopped && m.state != StateStopping && generation != 0 && runCtx != nil && runCtx.Err() == nil
+	strictGeneration := request.generation == generation
+	m.mu.RUnlock()
+	if !active || !strictGeneration {
+		return recoveryRetryResult{generation: generation}
+	}
+
 	m.recoverCount++
 	if m.recoverFirstFailAt.IsZero() {
 		m.recoverFirstFailAt = time.Now()
@@ -3324,11 +4926,10 @@ func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string
 		m.log.WithField("reason", reason).
 			WithField("recovery_reason", request.reason).
 			WithField("attempts", m.recoverCount).
-			Warn("Core recovery exhausted; emitting terminal event and stopping retries")
+			Warn("Core recovery exhausted; stopping retries")
 		m.recoverCount = 0
 		m.recoverFirstFailAt = time.Time{}
-		m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Reason: "recovery_exhausted"})
-		return
+		return recoveryRetryResult{terminalReason: "recovery_exhausted", generation: generation}
 	}
 	delay := m.getRecoverDelay()
 	m.log.
@@ -3338,6 +4939,7 @@ func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string
 	m.scheduleAfter(delay, func() {
 		m.enqueueCoreRecoveryRetry(request, reason)
 	})
+	return recoveryRetryResult{generation: generation}
 }
 
 func (m *Manager) getRecoverDelay() time.Duration {
@@ -3392,41 +4994,81 @@ func jitteredFullCheckInterval(base time.Duration) time.Duration {
 }
 
 func (m *Manager) doConnect() error {
+	return m.doConnectForGeneration(m.coreGeneration.Load())
+}
+
+func (m *Manager) doConnectForGeneration(generation uint64) error {
+	dialCtx, cancelDial := m.opContext(m.cfg.Timeouts.Dial)
+	defer cancelDial()
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	m.mu.RLock()
+	stopped := m.stopped
+	m.mu.RUnlock()
+	if stopped {
+		return ErrManagerStopped
+	}
+	return m.doConnectLocked(dialCtx, generation)
+}
+
+func (m *Manager) doConnectLocked(dialCtx context.Context, generation uint64) error {
+	if dialCtx == nil || dialCtx.Err() != nil {
+		return context.Canceled
+	}
 	m.connectMu.Lock()
 	defer m.connectMu.Unlock()
 
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return ErrManagerStopped
+	}
+	if m.state == StateStopping || dialCtx.Err() != nil {
+		m.mu.Unlock()
+		return context.Canceled
+	}
+	token := coreSessionToken{generation: generation, client: m.client, runCtx: m.ctx}
+	if !m.coreSessionCurrentLocked(token) {
+		m.mu.Unlock()
+		return ErrServiceNotReady("qmi-core")
+	}
 	if !m.desiredConnection {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.state == StateConnected || m.state == StateStopping {
+	dataReady := (m.cfg.EnableIPv4 && m.handleV4 != 0) || (!m.cfg.EnableIPv4 && m.cfg.EnableIPv6 && m.handleV6 != 0)
+	if m.state == StateConnected && dataReady {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.state == StateConnecting && m.handleV4 != 0 {
+	if m.state == StateConnecting && dataReady {
 		m.mu.Unlock()
 		return fmt.Errorf("connection already in progress")
 	}
 	m.state = StateConnecting
 	m.mu.Unlock()
 
-	dialCtx, cancelDial := m.opContext(m.cfg.Timeouts.Dial)
-	defer cancelDial()
-
 	if m.useSIMCOMNDIS() {
-		return m.doSIMCOMNDISConnect(dialCtx)
+		return m.doSIMCOMNDISConnect(dialCtx, generation)
 	}
 
 	if err := m.ensureDataPlaneServices(dialCtx); err != nil {
-		m.handleDialFailure(err)
+		if dialCtx.Err() != nil || !m.coreSessionCurrent(token) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		m.handleDialFailure(err, generation)
 		return err
+	}
+	if !m.coreSessionCurrent(token) {
+		return ErrServiceNotReady("qmi-core")
 	}
 
 	if m.wds == nil && m.wdsV6 == nil {
 		err := fmt.Errorf("wds service not available")
 		m.log.Error("WDS service not available")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 
@@ -3503,9 +5145,7 @@ func (m *Manager) doConnect() error {
 	}
 
 	// Check registration / 检查注册状态
-	if registered, regErr := withNASRecoveryValue(m, "doConnect.IsRegistered", func(nas *qmi.NASService) (bool, error) {
-		return nas.IsRegistered(dialCtx)
-	}); regErr == nil {
+	if registered, regErr := m.queryNASRegisteredWithContext(dialCtx); regErr == nil {
 		if !registered {
 			m.log.Info("Waiting for network registration...")
 			// Don't fail - continue and let the dial fail if not registered / 不报错 - 继续执行，让拨号过程去处理未注册的情况
@@ -3514,55 +5154,76 @@ func (m *Manager) doConnect() error {
 		m.log.WithError(regErr).Debug("Failed to query registration state before dialing")
 	}
 
-	// Start IPv4 data call / 启动IPv4数据呼叫
-	if m.cfg.EnableIPv4 {
-		m.log.Info("Starting IPv4 data call...")
-		handle, err := m.wds.StartNetworkInterface(dialCtx,
-			m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV4)
-		if err != nil {
-			m.log.WithError(err).Error("IPv4 dial failed")
-			m.handleDialFailure(err)
-			return err
-		}
-		m.handleV4 = handle
-		m.log.Infof("IPv4 connected, handle=0x%08x", handle)
-	}
-
-	// Start IPv6 data call / 启动IPv6数据呼叫
-	if m.cfg.EnableIPv6 && m.wdsV6 != nil {
-		m.log.Info("Starting IPv6 data call...")
-		handle, err := m.wdsV6.StartNetworkInterface(dialCtx,
-			m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
-		if err != nil {
-			m.log.WithError(err).Warn("IPv6 dial failed")
-			// Continue with IPv4 only
-		} else {
-			m.handleV6 = handle
-			m.log.Infof("IPv6 connected, handle=0x%08x", handle)
-		}
+	if err := m.dialMissingDataFamilies(dialCtx, token); err != nil {
+		m.log.WithError(err).Error("Data call dial failed")
+		m.handleDialFailure(err, generation)
+		return err
 	}
 
 	// Get IP settings and configure interface / 获取IP设置并配置接口
 	if err := m.configureNetwork(); err != nil {
 		m.log.WithError(err).Error("Network configuration failed")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 
-	m.setState(StateConnected)
-	m.retryCount = 0
+	if err := m.commitConnected(dialCtx, generation, nil, 0, false); err != nil {
+		return err
+	}
 	m.log.Info("Connection established successfully!")
+	return nil
+}
 
-	// Emit connected event / 发送连接事件
-	m.mu.RLock()
-	settings := m.settings
-	m.mu.RUnlock()
-	m.emitEvent(Event{Type: EventConnected, State: StateConnected, Settings: settings})
+func (m *Manager) commitConnected(
+	ctx context.Context,
+	generation uint64,
+	settings *qmi.RuntimeSettings,
+	handleV4 uint32,
+	setSession bool,
+) error {
+	if m.beforeConnectCommitHook != nil {
+		m.beforeConnectCommitHook()
+	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.state == StateStopping {
+		return ErrManagerStopped
+	}
+	if ctx == nil ||
+		ctx.Err() != nil ||
+		generation == 0 ||
+		m.coreGeneration.Load() != generation ||
+		!m.desiredConnection {
+		return context.Canceled
+	}
+	if setSession {
+		m.handleV4 = handleV4
+		m.settings = settings
+	}
+	if settings == nil {
+		settings = m.settings
+	}
+	if m.state != StateConnected {
+		m.log.Infof("State: %s -> %s", m.state, StateConnected)
+		m.state = StateConnected
+	}
+	m.retryCount = 0
+	if m.events != nil {
+		m.events.Emit(Event{
+			Type:       EventConnected,
+			Generation: generation,
+			State:      StateConnected,
+			Settings:   settings,
+		})
+	}
 	return nil
 }
 
 func (m *Manager) configureNetwork() error {
+	if m.configureNetworkHook != nil {
+		return m.configureNetworkHook()
+	}
 	// 多路拨号模式下，IP/DNS/Route 配置在虚拟网卡上
 	ifname := m.cfg.Device.NetInterface
 	m.mu.RLock()
@@ -3701,57 +5362,169 @@ func (m *Manager) configureNetwork() error {
 	return nil
 }
 
-func (m *Manager) doDisconnect() {
-	m.log.Info("Disconnecting...")
+func (m *Manager) doDisconnect() error {
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
 	defer cancel()
 
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	return m.doDisconnectLocked(ctx)
+}
+
+func (m *Manager) doDisconnectLocked(ctx context.Context) error {
+	m.log.Info("Disconnecting...")
+	var disconnectErrs []error
+
+	m.mu.RLock()
+	token := coreSessionToken{generation: m.coreGeneration.Load(), client: m.client, runCtx: m.ctx}
+	m.mu.RUnlock()
+	commitDisconnected := func() {
+		publish := false
+		m.mu.Lock()
+		sameCore := token.generation != 0 &&
+			m.coreGeneration.Load() == token.generation &&
+			m.client == token.client &&
+			m.ctx == token.runCtx &&
+			!m.stopped &&
+			m.state != StateStopping
+		if sameCore {
+			m.settings = nil
+			if m.state != StateDisconnected {
+				m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+				m.state = StateDisconnected
+			}
+			publish = m.coreSessionCurrentLocked(token)
+		}
+		m.mu.Unlock()
+		if publish {
+			m.emitEventForGeneration(Event{Type: EventDisconnected, State: StateDisconnected}, token.generation)
+		}
+	}
+
 	if m.useSIMCOMNDIS() {
 		m.doSIMCOMNDISDisconnect(ctx)
-		m.setState(StateDisconnected)
-		m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
-		return
+		commitDisconnected()
+		return nil
 	}
 
-	if m.handleV4 != 0 && m.wds != nil {
-		_ = m.wds.StopNetworkInterface(ctx, m.handleV4)
-		m.handleV4 = 0
+	m.mu.RLock()
+	wds, wdsV6 := m.wds, m.wdsV6
+	handleV4, handleV6 := m.handleV4, m.handleV6
+	ifname := strings.TrimSpace(m.muxIface)
+	if ifname == "" {
+		ifname = strings.TrimSpace(m.cfg.Device.NetInterface)
 	}
-	if m.handleV6 != 0 && m.wdsV6 != nil {
-		_ = m.wdsV6.StopNetworkInterface(ctx, m.handleV6)
-		m.handleV6 = 0
+	pending := make([]pendingDataCall, 0, len(m.pendingDataCalls))
+	for _, call := range m.pendingDataCalls {
+		if call.generation == token.generation {
+			pending = append(pending, call)
+		}
+	}
+	m.mu.RUnlock()
 
+	active := make([]pendingDataCall, 0, 2)
+	if handleV4 != 0 && wds != nil {
+		active = append(active, pendingDataCall{generation: token.generation, wds: wds, family: qmi.IpFamilyV4, handle: handleV4})
+	}
+	if handleV6 != 0 && wdsV6 != nil {
+		active = append(active, pendingDataCall{generation: token.generation, wds: wdsV6, family: qmi.IpFamilyV6, handle: handleV6})
 	}
 
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
-	netcfg.FlushRoutes(m.cfg.Device.NetInterface)
-	netcfg.BringDown(m.cfg.Device.NetInterface)
+	for _, call := range active {
+		stopErr := m.stopDataCall(ctx, call.wds, call.handle)
+		m.mu.Lock()
+		if m.coreGeneration.Load() == call.generation {
+			switch call.family {
+			case qmi.IpFamilyV4:
+				if m.wds == call.wds && m.handleV4 == call.handle {
+					if stopErr != nil {
+						m.moveActiveDataCallToPendingLocked(call.generation, call.wds, call.family, call.handle)
+					} else {
+						m.handleV4 = 0
+						m.removePendingDataCallLocked(call.generation, call.wds, call.family, call.handle)
+					}
+				}
+			case qmi.IpFamilyV6:
+				if m.wdsV6 == call.wds && m.handleV6 == call.handle {
+					if stopErr != nil {
+						m.moveActiveDataCallToPendingLocked(call.generation, call.wds, call.family, call.handle)
+					} else {
+						m.handleV6 = 0
+						m.removePendingDataCallLocked(call.generation, call.wds, call.family, call.handle)
+					}
+				}
+			}
+		}
+		m.mu.Unlock()
+		if stopErr != nil {
+			m.log.WithError(stopErr).Warnf("Failed to stop active data call 0x%08x", call.handle)
+			disconnectErrs = append(disconnectErrs, fmt.Errorf("stop active data call 0x%08x: %w", call.handle, stopErr))
+		}
+	}
 
-	m.mu.Lock()
-	m.settings = nil
-	m.mu.Unlock()
+	for _, call := range pending {
+		duplicateActive := false
+		for _, current := range active {
+			if pendingDataCallEqual(call, current.generation, current.wds, current.family, current.handle) {
+				duplicateActive = true
+				break
+			}
+		}
+		if duplicateActive {
+			continue
+		}
+		stopErr := m.stopDataCall(ctx, call.wds, call.handle)
+		if stopErr == nil {
+			m.mu.Lock()
+			m.removePendingDataCallLocked(call.generation, call.wds, call.family, call.handle)
+			m.mu.Unlock()
+		} else {
+			m.log.WithError(stopErr).Warnf("Failed to release pending data call 0x%08x", call.handle)
+			disconnectErrs = append(disconnectErrs, fmt.Errorf("release pending data call 0x%08x: %w", call.handle, stopErr))
+		}
+	}
 
-	m.setState(StateDisconnected)
+	if ifname != "" {
+		var hostErr error
+		if m.disconnectHostCleanupHook != nil {
+			hostErr = m.disconnectHostCleanupHook(ifname)
+		} else {
+			hostErr = errors.Join(
+				netcfg.FlushAddresses(ifname),
+				netcfg.FlushRoutes(ifname),
+				netcfg.BringDown(ifname),
+			)
+		}
+		if hostErr != nil {
+			m.log.WithError(hostErr).Warn("Failed to clean disconnected host data plane")
+			disconnectErrs = append(disconnectErrs, fmt.Errorf("clean disconnected host data plane: %w", hostErr))
+		}
+	}
 
-	// Emit disconnected event / 发送断开连接事件
-	m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
+	commitDisconnected()
+	return errors.Join(disconnectErrs...)
 }
 
 func (m *Manager) doStatusCheck(full bool) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	m.mu.RLock()
 	if m.isRotating {
 		m.mu.RUnlock()
 		return // Skip check during rotation / 轮换期间跳过检查
 	}
 	currentState := m.state
-	desiredConnection := m.desiredConnection
+	token := coreSessionToken{generation: m.coreGeneration.Load(), client: m.client, runCtx: m.ctx}
+	generation := token.generation
 	m.mu.RUnlock()
 
 	if currentState == StateStopping || currentState == StateDisconnected {
 		return
 	}
 
-	if m.client == nil {
+	if token.client == nil {
 		return
 	}
 
@@ -3779,12 +5552,12 @@ func (m *Manager) doStatusCheck(full bool) {
 	}
 
 	if m.useSIMCOMNDIS() {
-		m.doSIMCOMNDISStatusCheck(currentState, desiredConnection)
+		m.doSIMCOMNDISStatusCheck(ctx, currentState, generation)
 		return
 	}
 
 	// 2. Query connection status / 2. 查询连接状态
-	status, err := m.getPacketServiceState(ctx)
+	status, statusFamily, err := m.getPacketServiceState(ctx)
 	if err != nil {
 		m.log.WithError(err).Debug("Status query failed")
 		return
@@ -3794,12 +5567,7 @@ func (m *Manager) doStatusCheck(full bool) {
 		if currentState != StateConnected {
 			m.log.Info("Connection restored")
 			m.configureNetwork()
-			m.setState(StateConnected)
-			m.retryCount = 0
-			m.mu.RLock()
-			settings := m.settings
-			m.mu.RUnlock()
-			m.emitEvent(Event{Type: EventConnected, State: StateConnected, Settings: settings})
+			_ = m.commitConnected(ctx, generation, nil, 0, false)
 		} else {
 			// Smart Check: Verify IP consistency (match C version) / 智能检查: 验证IP一致性 (匹配C版本逻辑)
 			shouldVerifyIP := full
@@ -3812,13 +5580,13 @@ func (m *Manager) doStatusCheck(full bool) {
 			if shouldVerifyIP {
 				if err := m.verifyIPConsistency(); err != nil {
 					m.log.WithError(err).Warn("IP consistency check failed - triggering redial")
-					m.doDisconnect()
-					m.mu.RLock()
-					isStopping := m.state == StateStopping
-					m.mu.RUnlock()
-					if m.cfg.AutoReconnect && desiredConnection && !isStopping {
-						m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected, Error: err})
-						m.eventCh <- eventStart
+					disconnectCtx, disconnectCancel := m.opContext(m.cfg.Timeouts.Stop)
+					if disconnectErr := m.doDisconnectLocked(disconnectCtx); disconnectErr != nil {
+						m.log.WithError(disconnectErr).Warn("Data disconnect was incomplete after IP consistency failure")
+					}
+					disconnectCancel()
+					if m.emitReconnectingForSessionIfDesired(token, err) {
+						_ = m.enqueueReconnectEvent(generation)
 					}
 				} else {
 					m.mu.Lock()
@@ -3830,18 +5598,27 @@ func (m *Manager) doStatusCheck(full bool) {
 	} else if status == qmi.StatusDisconnected {
 		if currentState == StateConnected {
 			m.log.Warn("Connection lost!")
-			m.handleV4 = 0
-			netcfg.FlushAddresses(m.cfg.Device.NetInterface)
-			m.setState(StateDisconnected)
-			m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
+			m.mu.Lock()
+			if !m.coreSessionCurrentLocked(token) {
+				m.mu.Unlock()
+				return
+			}
+			switch statusFamily {
+			case qmi.IpFamilyV6:
+				m.handleV6 = 0
+			default:
+				m.handleV4 = 0
+			}
+			m.settings = nil
+			m.state = StateDisconnected
+			m.mu.Unlock()
 
-			// Trigger reconnect
-			m.mu.RLock()
-			isStopping := m.state == StateStopping
-			m.mu.RUnlock()
-			if m.cfg.AutoReconnect && desiredConnection && !isStopping {
-				m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected})
-				m.eventCh <- eventStart
+			if flushErr := m.flushRotationAddresses(m.dataInterfaceName()); flushErr != nil {
+				m.log.WithError(flushErr).Warn("Failed to flush host data plane after packet service disconnect")
+			}
+			m.emitEventForGeneration(Event{Type: EventDisconnected, State: StateDisconnected}, generation)
+			if m.emitReconnectingForSessionIfDesired(token, nil) {
+				_ = m.enqueueReconnectEvent(generation)
 			}
 		}
 	}
@@ -3868,28 +5645,66 @@ func (m *Manager) verifyIPConsistency() error {
 	return nil
 }
 
-func (m *Manager) handleDialFailure(err error) {
-	m.setState(StateDisconnected)
-	m.emitEvent(Event{Type: EventDialFailed, State: StateDisconnected, Error: err})
-
-	m.mu.RLock()
-	desiredConnection := m.desiredConnection
-	m.mu.RUnlock()
-	if !m.cfg.AutoReconnect || !desiredConnection {
+func (m *Manager) handleDialFailure(err error, generation uint64) {
+	m.mu.Lock()
+	runCtx := m.ctx
+	if m.stopped ||
+		m.state == StateStopping ||
+		generation == 0 ||
+		m.coreGeneration.Load() != generation ||
+		runCtx == nil ||
+		runCtx.Err() != nil {
+		m.mu.Unlock()
 		return
 	}
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
+	desiredConnection := m.desiredConnection
+	if m.events != nil {
+		m.events.Emit(Event{
+			Type:       EventDialFailed,
+			Generation: generation,
+			State:      StateDisconnected,
+			Error:      err,
+		})
+	}
+	if !m.cfg.AutoReconnect || !desiredConnection {
+		m.mu.Unlock()
+		return
+	}
+	token := coreSessionToken{generation: generation, client: m.client, runCtx: runCtx}
 
 	delay := m.getRetryDelay()
 	m.retryCount++
-	if m.retryCount == m.cfg.RetryPolicy.RadioResetAfter {
-		go m.RadioReset()
+	radioReset := m.retryCount == m.cfg.RetryPolicy.RadioResetAfter
+	if m.events != nil {
+		m.events.Emit(Event{
+			Type:       EventReconnecting,
+			Generation: generation,
+			State:      StateDisconnected,
+			Error:      err,
+		})
 	}
-	m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected, Error: err})
 	m.log.Infof("Will retry in %v (%d/%d)", delay, m.retryCount, len(m.retryDelays))
 	m.reconnectScheduled.Add(1)
+	m.mu.Unlock()
 
+	if radioReset {
+		// Dial failure handling runs inside doConnectLocked, which already owns
+		// lifecycleMu and connectMu. Perform the reset synchronously against the
+		// exact failed session instead of spawning an unowned lifecycle bypass.
+		resetCtx, resetCancel := contextWithMaxTimeout(token.runCtx, m.cfg.Timeouts.Stop)
+		if _, resetErr := m.radioPowerCycleForSession(resetCtx, token, "handleDialFailure.RadioPowerCycle"); resetErr != nil {
+			m.log.WithError(resetErr).Warn("Radio reset after dial failures did not complete")
+		}
+		resetCancel()
+	}
 	m.scheduleAfter(delay, func() {
-		m.eventCh <- eventStart
+		if m.enqueueReconnectEvent(generation) == internalEventQueueFull {
+			m.log.Warn("Internal event queue is full while scheduling reconnect")
+		}
 	})
 }
 
@@ -3904,16 +5719,17 @@ func (m *Manager) getRetryDelay() time.Duration {
 // Indication Handler
 // ============================================================================
 
-func (m *Manager) indicationHandler() {
+func (m *Manager) indicationHandler(runCtx context.Context) {
 	defer m.wg.Done()
 
 	for {
-		if m.ctx.Err() != nil {
+		if runCtx.Err() != nil {
 			return
 		}
 
 		m.mu.RLock()
 		client := m.client
+		generation := m.coreGeneration.Load()
 		m.mu.RUnlock()
 
 		if client == nil {
@@ -3925,16 +5741,40 @@ func (m *Manager) indicationHandler() {
 	readEvents:
 		for {
 			select {
-			case <-m.ctx.Done():
+			case <-runCtx.Done():
 				return
 			case evt, ok := <-eventsCh:
 				if !ok {
 					time.Sleep(200 * time.Millisecond)
 					break readEvents
 				}
-				m.handleIndication(evt)
+				m.handleIndicationForSession(client, generation, evt)
 			}
 		}
+	}
+}
+
+func (m *Manager) handleIndicationForSession(client *qmi.Client, generation uint64, evt qmi.Event) {
+	if m == nil || client == nil || generation == 0 {
+		return
+	}
+
+	// Core replacement is serialized by lifecycleMu. Holding it across the
+	// handler makes validation and all snapshot/event side effects one exact
+	// client-generation operation.
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.RLock()
+	runCtx := m.ctx
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		m.client == client &&
+		m.coreGeneration.Load() == generation &&
+		runCtx != nil &&
+		runCtx.Err() == nil
+	m.mu.RUnlock()
+	if active {
+		m.handleIndication(evt)
 	}
 }
 
@@ -3942,6 +5782,7 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 	if shouldLogRawIndication(evt) {
 		m.log.Debugf("Indication: type=%d service=0x%02x msg=0x%04x", evt.Type, evt.ServiceID, evt.MessageID)
 	}
+	generation := m.coreGeneration.Load()
 
 	switch evt.Type {
 	case qmi.EventPacketServiceStatusChanged:
@@ -3955,7 +5796,7 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 			}
 		}
 		m.emitEvent(event)
-		m.eventCh <- eventPacketStatusChanged
+		_ = m.enqueueInternalEvent(eventPacketStatusChanged, generation)
 
 	case qmi.EventServingSystemChanged:
 		event := m.qmiIndicationEvent(EventServingSystemChanged, evt)
@@ -4056,7 +5897,7 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 			m.maybeSchedulePostRegRefresh(previousServing, event.ServingSystem, "serving_indication")
 		}
 		m.emitEvent(event)
-		m.eventCh <- eventServingSystemChanged
+		_ = m.enqueueInternalEvent(eventServingSystemChanged, generation)
 
 	case qmi.EventNASOperatorNameChanged:
 		event := m.qmiIndicationEvent(EventNASOperatorNameChanged, evt)
@@ -4417,26 +6258,166 @@ func shouldLogRawIndication(evt qmi.Event) bool {
 // Radio Reset Recovery
 // ============================================================================
 
-// RadioReset performs a radio power cycle to recover from stuck states / 射频重置: 执行射频电源循环以从卡死状态恢复
-func (m *Manager) RadioReset() error {
-	m.log.Info("Performing radio reset...")
-	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
-	defer cancel()
+// radioPowerCycleForSession performs the QMI operation for a caller that
+// already owns lifecycleMu (and, for data paths, connectMu).
+type radioPowerCycleResult struct {
+	dataInvalidated bool
+	hadData         bool
+}
 
-	if err := m.withDMSRecovery("RadioReset.RadioPowerCycle", func(dms *qmi.DMSService) error {
-		// Turn radio off / 关闭射频
-		if powerErr := dms.RadioPower(ctx, false); powerErr != nil {
-			return fmt.Errorf("failed to turn radio off: %w", powerErr)
+func (m *Manager) runRadioPowerCommand(ctx context.Context, token coreSessionToken, on bool, op string) error {
+	if m.radioPowerCommandHook != nil {
+		return m.radioPowerCommandHook(ctx, token, on, op)
+	}
+	return m.withDMSRecovery(op, func(dms *qmi.DMSService) error {
+		if ctx.Err() != nil || !m.coreSessionCurrent(token) {
+			return ErrServiceNotReady("qmi-core")
 		}
-		// Turn radio on / 打开射频
-		if powerErr := dms.RadioPower(ctx, true); powerErr != nil {
+		return dms.RadioPower(ctx, on)
+	})
+}
+
+// invalidateDataPlaneAfterRadioOff is the linearization point after a
+// successful RadioPower(false). Both modem data calls are gone at this point,
+// so old handles and settings must never survive even if power-on later fails.
+func (m *Manager) invalidateDataPlaneAfterRadioOff(token coreSessionToken) (hadData bool, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.coreSessionCurrentLocked(token) {
+		return false, false
+	}
+	pendingTerminated := false
+	kept := m.pendingDataCalls[:0]
+	for _, call := range m.pendingDataCalls {
+		if call.generation == token.generation {
+			pendingTerminated = true
+			continue
+		}
+		kept = append(kept, call)
+	}
+	m.pendingDataCalls = kept
+	hadData = m.handleV4 != 0 || m.handleV6 != 0 || pendingTerminated || m.settings != nil || m.state == StateConnected || m.state == StateConnecting
+	m.handleV4 = 0
+	m.handleV6 = 0
+	m.settings = nil
+	if m.state == StateConnected || m.state == StateConnecting {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
+	return hadData, true
+}
+
+func (m *Manager) radioPowerCycleForSession(ctx context.Context, token coreSessionToken, op string) (result radioPowerCycleResult, err error) {
+	if ctx == nil || ctx.Err() != nil || !m.coreSessionCurrent(token) {
+		return result, ErrServiceNotReady("qmi-core")
+	}
+
+	m.log.Info("Turning radio off...")
+	if powerErr := m.runRadioPowerCommand(ctx, token, false, op+".Off"); powerErr != nil {
+		return result, fmt.Errorf("failed to turn radio off: %w", powerErr)
+	}
+	result.hadData, result.dataInvalidated = m.invalidateDataPlaneAfterRadioOff(token)
+	if !result.dataInvalidated {
+		return result, ErrServiceNotReady("qmi-core")
+	}
+	if result.hadData {
+		if flushErr := m.flushRadioDataPlane(m.dataInterfaceName()); flushErr != nil {
+			// RadioPower(false) already invalidated the modem calls. Host cleanup
+			// failure must not strand the radio in the off state.
+			m.log.WithError(flushErr).Warn("Failed to flush host data plane after radio power-off")
+		}
+	}
+	if !m.coreSessionCurrent(token) {
+		return result, ErrServiceNotReady("qmi-core")
+	}
+
+	// RadioPower(false) creates a compensation obligation. A caller-specific
+	// timeout after that point must not leave an otherwise-current modem powered
+	// off, so power-on gets one fresh bounded attempt while the exact core token
+	// remains valid. Stop/recovery invalidates the token and forbids that retry.
+	runPowerOn := func(onCtx context.Context) error {
+		m.log.Info("Turning radio on...")
+		if powerErr := m.runRadioPowerCommand(onCtx, token, true, op+".On"); powerErr != nil {
 			return fmt.Errorf("failed to turn radio on: %w", powerErr)
 		}
 		return nil
-	}); err != nil {
-		return err
+	}
+	freshPowerOn := func() error {
+		timeout := m.cfg.Timeouts.Stop
+		if timeout <= 0 {
+			timeout = defaultTimeouts.Stop
+		}
+		onCtx, onCancel := context.WithTimeout(context.Background(), timeout)
+		defer onCancel()
+		if !m.coreSessionCurrent(token) {
+			return ErrServiceNotReady("qmi-core")
+		}
+		return runPowerOn(onCtx)
 	}
 
+	if originalErr := ctx.Err(); originalErr != nil {
+		onErr := freshPowerOn()
+		return result, errors.Join(originalErr, onErr)
+	}
+
+	if onErr := runPowerOn(ctx); onErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && m.coreSessionCurrent(token) {
+			compensationErr := freshPowerOn()
+			return result, errors.Join(ctxErr, onErr, compensationErr)
+		}
+		return result, onErr
+	}
+	if !m.coreSessionCurrent(token) {
+		return result, ErrServiceNotReady("qmi-core")
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, ctxErr
+	}
+	return result, nil
+}
+
+func (m *Manager) publishRadioResetInvalidation(token coreSessionToken, result radioPowerCycleResult, resetErr error) {
+	if !result.dataInvalidated || !result.hadData {
+		return
+	}
+	m.mu.RLock()
+	active := m.coreSessionCurrentLocked(token) && m.handleV4 == 0 && m.handleV6 == 0 && m.state == StateDisconnected
+	m.mu.RUnlock()
+	if !active {
+		return
+	}
+	m.emitEventForGeneration(Event{Type: EventDisconnected, State: StateDisconnected, Error: resetErr}, token.generation)
+	if m.emitReconnectingForSessionIfDesired(token, resetErr) {
+		_ = m.enqueueReconnectEvent(token.generation)
+	}
+}
+
+// RadioReset performs a radio power cycle to recover from stuck states / 射频重置: 执行射频电源循环以从卡死状态恢复
+func (m *Manager) RadioReset() error {
+	if m == nil {
+		return ErrServiceNotReady("qmi-core")
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
+	m.mu.RLock()
+	token := coreSessionToken{generation: m.coreGeneration.Load(), client: m.client, runCtx: m.ctx}
+	current := m.coreSessionCurrentLocked(token)
+	m.mu.RUnlock()
+	if !current {
+		return ErrServiceNotReady("qmi-core")
+	}
+
+	m.log.Info("Performing radio reset...")
+	ctx, cancel := contextWithMaxTimeout(token.runCtx, m.cfg.Timeouts.Stop)
+	defer cancel()
+	result, resetErr := m.radioPowerCycleForSession(ctx, token, "RadioReset.RadioPowerCycle")
+	m.publishRadioResetInvalidation(token, result, resetErr)
+	if resetErr != nil {
+		return resetErr
+	}
 	m.log.Info("Radio reset completed")
 	return nil
 }

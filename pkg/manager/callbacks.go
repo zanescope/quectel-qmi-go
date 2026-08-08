@@ -140,6 +140,7 @@ func (e EventType) String() string {
 // Event represents a connection event / Event 表示连接事件
 type Event struct {
 	Type                      EventType                                       // Event type / 事件类型
+	Generation                uint64                                          // Manager core generation that produced the event
 	State                     State                                           // Current state / 当前状态
 	Settings                  *qmi.RuntimeSettings                            // IP settings (for Connected/IPChanged) / IP 设置
 	Error                     error                                           // Error (for DialFailed) / 错误信息

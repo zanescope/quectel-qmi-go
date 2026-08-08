@@ -18,10 +18,10 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 	if m == nil {
 		return
 	}
-	generation := m.snapshot.IdentityGeneration()
-	go func(gen uint64) {
+	m.launchCoreBackgroundTask(func(lifetimeCtx context.Context, token coreSessionToken) {
+		identityGeneration := m.snapshot.IdentityGeneration()
 		// 给予足够的超时时间，避免后台抓取时与其他初始化流程抢占导致超时
-		ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := contextWithMaxTimeout(lifetimeCtx, 10*time.Second)
 		defer cancel()
 
 		var wg sync.WaitGroup
@@ -74,10 +74,16 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 				ids.ICCID = iccid
 				lock.Unlock()
 			}
+			if ctx.Err() != nil {
+				return
+			}
 			if imsi, err := m.GetIMSI(ctx); err == nil {
 				lock.Lock()
 				ids.IMSI = imsi
 				lock.Unlock()
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			if simStatus, err := m.GetSIMStatus(ctx); err == nil {
 				lock.Lock()
@@ -88,12 +94,25 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		}()
 
 		wg.Wait()
-		if !m.snapshot.UpdateIdentitiesIfGeneration(ids, gen) {
-			m.log.WithField("generation", gen).Debug("Skip stale device identities pre-warm write")
+		if ctx.Err() != nil {
+			return
+		}
+		m.mu.RLock()
+		currentSession := m.coreSessionCurrentLocked(token)
+		updated := false
+		if currentSession {
+			updated = m.snapshot.UpdateIdentitiesIfGeneration(ids, identityGeneration)
+		}
+		m.mu.RUnlock()
+		if !currentSession {
+			return
+		}
+		if !updated {
+			m.log.WithField("generation", identityGeneration).Debug("Skip stale device identities pre-warm write")
 			return
 		}
 		m.log.WithField("imei", ids.IMEI).WithField("iccid", ids.ICCID).Debug("Device identities pre-warmed")
-	}(generation)
+	})
 }
 
 // GetCachedIdentities 提供给上层应用零 IPC 读取当前设备的基础与卡标识。

@@ -55,15 +55,15 @@ func (m *Manager) runSIMCOMDHCP(ctx context.Context, ifname string) error {
 	return runDHCPClient(ctx, ifname)
 }
 
-func (m *Manager) doSIMCOMNDISConnect(ctx context.Context) error {
+func (m *Manager) doSIMCOMNDISConnect(ctx context.Context, generation uint64) error {
 	if m.cfg.MuxID > 0 {
 		err := fmt.Errorf("SIMCOM NDIS AT data mode does not support QMAP mux")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 	if !m.cfg.EnableIPv4 {
 		err := fmt.Errorf("SIMCOM NDIS AT data mode requires IPv4")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 	if m.cfg.EnableIPv6 {
@@ -76,7 +76,7 @@ func (m *Manager) doSIMCOMNDISConnect(ctx context.Context) error {
 	ifname := strings.TrimSpace(m.cfg.Device.NetInterface)
 	if ifname == "" {
 		err := fmt.Errorf("SIMCOM NDIS mode requires a network interface")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 
@@ -93,16 +93,16 @@ func (m *Manager) doSIMCOMNDISConnect(ctx context.Context) error {
 	if apn := strings.TrimSpace(m.cfg.APN); apn != "" {
 		cmd := fmt.Sprintf(`AT+CGDCONT=1,"IP","%s"`, escapeATString(apn))
 		if _, err := m.runSIMCOMAT(ctx, cmd, m.cfg.Timeouts.Dial); err != nil {
-			m.handleDialFailure(err)
+			m.handleDialFailure(err, generation)
 			return fmt.Errorf("set SIMCOM PDP context: %w", err)
 		}
 	}
 	if _, err := m.runSIMCOMAT(ctx, "AT$QCRMCALL=1,1", m.cfg.Timeouts.Dial); err != nil {
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return fmt.Errorf("start SIMCOM NDIS call: %w", err)
 	}
 	if err := m.runSIMCOMDHCP(ctx, ifname); err != nil {
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return fmt.Errorf("acquire SIMCOM NDIS DHCP lease: %w", err)
 	}
 
@@ -112,20 +112,15 @@ func (m *Manager) doSIMCOMNDISConnect(ctx context.Context) error {
 	}
 	if ip == nil {
 		err := fmt.Errorf("SIMCOM NDIS DHCP completed without an IPv4 address")
-		m.handleDialFailure(err)
+		m.handleDialFailure(err, generation)
 		return err
 	}
 	settings := &qmi.RuntimeSettings{IPv4Address: ip, IPv4Subnet: net.CIDRMask(32, 32)}
 
-	m.mu.Lock()
-	m.handleV4 = simcomNDISHandle
-	m.settings = settings
-	m.mu.Unlock()
-
-	m.setState(StateConnected)
-	m.retryCount = 0
+	if err := m.commitConnected(ctx, generation, settings, simcomNDISHandle, true); err != nil {
+		return err
+	}
 	m.log.Infof("SIMCOM NDIS data call established, IPv4=%s", ip)
-	m.emitEvent(Event{Type: EventConnected, State: StateConnected, Settings: settings})
 	return nil
 }
 
@@ -146,7 +141,7 @@ func (m *Manager) doSIMCOMNDISDisconnect(ctx context.Context) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) doSIMCOMNDISStatusCheck(currentState State, desiredConnection bool) {
+func (m *Manager) doSIMCOMNDISStatusCheck(ctx context.Context, currentState State, generation uint64) {
 	ifname := strings.TrimSpace(m.cfg.Device.NetInterface)
 	if ifname == "" {
 		return
@@ -159,27 +154,46 @@ func (m *Manager) doSIMCOMNDISStatusCheck(currentState State, desiredConnection 
 	if ip != nil {
 		if currentState != StateConnected {
 			settings := &qmi.RuntimeSettings{IPv4Address: ip, IPv4Subnet: net.CIDRMask(32, 32)}
-			m.mu.Lock()
-			m.handleV4 = simcomNDISHandle
-			m.settings = settings
-			m.mu.Unlock()
-			m.setState(StateConnected)
-			m.retryCount = 0
-			m.emitEvent(Event{Type: EventConnected, State: StateConnected, Settings: settings})
+			_ = m.commitConnected(ctx, generation, settings, simcomNDISHandle, true)
 		}
 		return
 	}
 	if currentState == StateConnected {
 		m.log.Warn("SIMCOM NDIS connection lost")
 		m.mu.Lock()
+		runCtx := m.ctx
+		if m.stopped ||
+			m.state == StateStopping ||
+			generation == 0 ||
+			m.coreGeneration.Load() != generation ||
+			runCtx == nil ||
+			runCtx.Err() != nil {
+			m.mu.Unlock()
+			return
+		}
 		m.handleV4 = 0
 		m.settings = nil
+		m.state = StateDisconnected
+		reconnect := m.cfg.AutoReconnect && m.desiredConnection
+		if m.events != nil {
+			m.events.Emit(Event{
+				Type:       EventDisconnected,
+				Generation: generation,
+				State:      StateDisconnected,
+			})
+		}
+		if reconnect {
+			if m.events != nil {
+				m.events.Emit(Event{
+					Type:       EventReconnecting,
+					Generation: generation,
+					State:      StateDisconnected,
+				})
+			}
+		}
 		m.mu.Unlock()
-		m.setState(StateDisconnected)
-		m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
-		if m.cfg.AutoReconnect && desiredConnection {
-			m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected})
-			m.eventCh <- eventStart
+		if reconnect {
+			_ = m.enqueueReconnectEvent(generation)
 		}
 	}
 }

@@ -268,14 +268,19 @@ func TestRealResetPreemptsQueuedSoftwareRecovery(t *testing.T) {
 	}
 
 	m.handleEvent(softwareEvent)
+	if got := m.Stats().RecoverAttempts; got != 0 {
+		t.Fatalf("superseded software wake triggered recovery: %d", got)
+	}
+
+	m.handleEvent(eventModemReset)
 	stats := m.Stats()
 	if stats.RecoverAttempts != 1 || stats.ResetEvents != 1 || stats.CoreRecoveryCoalesced != 1 {
 		t.Fatalf("real reset did not preempt software recovery: %+v", stats)
 	}
 
-	m.handleEvent(eventModemReset)
+	m.handleEvent(eventCoreRecovery)
 	if got := m.Stats().RecoverAttempts; got != 1 {
-		t.Fatalf("stale reset wake triggered an extra recovery: %d", got)
+		t.Fatalf("stale software wake triggered an extra recovery: %d", got)
 	}
 }
 

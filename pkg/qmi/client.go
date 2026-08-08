@@ -385,6 +385,13 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 	return c, nil
 }
 
+// UsesProxy reports the transport mode actually selected by the client.
+// It can differ from the requested option when proxy fallback to raw QMI was
+// enabled and the proxy transport or proxy device-open step failed.
+func (c *Client) UsesProxy() bool {
+	return c != nil && c.opts.UseProxy
+}
+
 // HasService 查询 modem 是否支持指定的 QMI 服务。
 // 如果尚未执行版本查询，返回 true（乐观假设）。
 func (c *Client) HasService(service uint8) bool {

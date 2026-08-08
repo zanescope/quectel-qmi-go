@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 )
 
 func TestEventRecoveryExhaustedString(t *testing.T) {
@@ -52,6 +54,13 @@ func TestScheduleRecoverRetryEmitsExhausted(t *testing.T) {
 		events: NewEventEmitter(),
 		cfg:    Config{RecoveryPolicy: RecoveryPolicy{MaxRecoverAttempts: 2}},
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.coreGeneration.Store(1)
+	m.client = &qmi.Client{}
+	m.lifetimeActive = true
+	m.coreReady = true
+	t.Cleanup(m.cancel)
+	t.Cleanup(m.events.Close)
 	// Prevent real time.AfterFunc timers from leaking into the test runtime.
 	m.afterFunc = func(_ time.Duration, fn func()) *time.Timer {
 		return time.NewTimer(time.Hour)
@@ -99,6 +108,10 @@ func TestDoRecoverFromModemResetEmitsDeviceRemoved(t *testing.T) {
 			RecoveryPolicy: RecoveryPolicy{},
 		},
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.coreGeneration.Store(1)
+	t.Cleanup(m.cancel)
+	t.Cleanup(m.events.Close)
 	// Prevent any real timers from being scheduled.
 	m.afterFunc = func(_ time.Duration, fn func()) *time.Timer {
 		return time.NewTimer(time.Hour)

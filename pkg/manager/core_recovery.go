@@ -26,10 +26,11 @@ const (
 )
 
 type recoveryRequest struct {
-	kind   recoveryKind
-	reason recoveryReason
-	detail string
-	retry  bool
+	kind       recoveryKind
+	reason     recoveryReason
+	detail     string
+	retry      bool
+	generation uint64
 }
 
 func (m *Manager) coreRecoveryLogger() Logger {
@@ -93,6 +94,24 @@ func isTransportDownError(err error) bool {
 		strings.Contains(message, "transport endpoint")
 }
 
+// clearRecoveryStateLocked resets all recovery bookkeeping for the current
+// manager lifetime. modemResetMu must be held. Callers that also need m.mu
+// always acquire m.mu first.
+func (m *Manager) clearRecoveryStateLocked() {
+	m.modemResetRecovering = false
+	m.modemResetPending = false
+	m.modemResetEnqueued = false
+	m.modemResetRequest = recoveryRequest{}
+	m.coreRecoveryEnqueued = false
+	m.coreRecoveryRequest = recoveryRequest{}
+	m.currentRecoveryRequest = recoveryRequest{}
+	m.coreRecoveryRetryPending = false
+	m.coreRecoveryRetryRequest = recoveryRequest{}
+	m.modemResetEnqueuedAt = time.Time{}
+	m.modemResetDeferred = false
+	m.recoveryGeneration = 0
+}
+
 func (m *Manager) enqueueModemResetEvent(source string) bool {
 	if m == nil {
 		return false
@@ -101,6 +120,22 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 
 	request := modemResetRecoveryRequest(source)
 	now := time.Now()
+
+	// Lock order for recovery state is m.mu -> modemResetMu.
+	m.mu.RLock()
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	inactive := m.stopped ||
+		m.state == StateStopping ||
+		generation == 0 ||
+		runCtx == nil ||
+		runCtx.Err() != nil
+	if inactive {
+		m.mu.RUnlock()
+		m.coreRecoveryLogger().WithField("source", source).Debug("Suppress modem reset while manager is stopping")
+		return false
+	}
+	request.generation = generation
 	m.modemResetMu.Lock()
 	if m.modemResetRecovering {
 		if m.modemResetPending {
@@ -108,28 +143,37 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 		} else {
 			m.modemResetPending = true
 		}
+		m.recoveryGeneration = generation
 		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Warn("Preserved modem reset indication while core recovery is running")
 		return true
+	}
+	if m.recoveryGeneration != 0 && m.recoveryGeneration != generation {
+		m.clearRecoveryStateLocked()
 	}
 	if m.modemResetEnqueued {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Coalesced duplicate modem reset indication")
 		return false
 	}
 	if !m.modemResetEnqueuedAt.IsZero() && now.Sub(m.modemResetEnqueuedAt) < m.modemResetDedupWindow {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Deduplicated modem reset indication inside debounce window")
 		return false
 	}
 	m.modemResetEnqueuedAt = now
 	m.modemResetEnqueued = true
 	m.modemResetRequest = request
+	m.recoveryGeneration = generation
 	m.modemResetMu.Unlock()
+	m.mu.RUnlock()
 
-	m.signalRecoveryEvent(eventModemReset)
+	m.signalRecoveryEvent(eventModemReset, generation)
 	return true
 }
 
@@ -164,8 +208,15 @@ func (m *Manager) enqueueCoreRecoveryEventWithOptions(request recoveryRequest, c
 	m.mu.RLock()
 	coreReady := m.coreReady
 	stopping := m.state == StateStopping
-	m.mu.RUnlock()
-	if stopping || (!coreReady && !allowNotReady) {
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	inactive := m.stopped ||
+		stopping ||
+		generation == 0 ||
+		runCtx == nil ||
+		runCtx.Err() != nil
+	if inactive || (!coreReady && !allowNotReady) {
+		m.mu.RUnlock()
 		if countRequest {
 			m.coreRecoverySuppressed.Add(1)
 		}
@@ -176,12 +227,46 @@ func (m *Manager) enqueueCoreRecoveryEventWithOptions(request recoveryRequest, c
 		return false
 	}
 
+	if request.retry {
+		// Retries belong to the attempt that scheduled them. Never upgrade a
+		// retired timer/request into work for the current session.
+		if request.generation == 0 || request.generation != generation {
+			m.mu.RUnlock()
+			m.coreRecoveryLogger().
+				WithField("recovery_reason", request.reason).
+				WithField("retry_generation", request.generation).
+				WithField("current_generation", generation).
+				Debug("Suppress stale core recovery retry")
+			return false
+		}
+	} else {
+		request.generation = generation
+	}
 	m.modemResetMu.Lock()
+	if !m.modemResetRecovering &&
+		m.recoveryGeneration != 0 &&
+		m.recoveryGeneration != generation {
+		m.clearRecoveryStateLocked()
+	}
 	if m.modemResetRecovering || m.modemResetEnqueued || m.coreRecoveryEnqueued {
+		if request.retry && m.modemResetRecovering {
+			// A backoff timer may fire before the current recovery unwinds. Preserve
+			// it in recovery state so finishRecovery can promote it atomically rather
+			// than coalescing away the only retry.
+			request.generation = generation
+			m.coreRecoveryRetryPending = true
+			m.coreRecoveryRetryRequest = request
+			m.recoveryGeneration = generation
+			m.modemResetMu.Unlock()
+			m.mu.RUnlock()
+			return true
+		}
+
 		if countRequest {
 			m.coreRecoveryCoalesced.Add(1)
 		}
 		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
 		m.coreRecoveryLogger().
 			WithField("recovery_reason", request.reason).
 			WithField("recovery_detail", request.detail).
@@ -190,47 +275,87 @@ func (m *Manager) enqueueCoreRecoveryEventWithOptions(request recoveryRequest, c
 	}
 	m.coreRecoveryEnqueued = true
 	m.coreRecoveryRequest = request
+	m.recoveryGeneration = generation
 	m.modemResetMu.Unlock()
 
-	if countRequest {
-		m.emitEvent(Event{
-			Type:   EventCoreRecoveryRequested,
-			State:  m.State(),
-			Reason: string(request.reason),
+	if countRequest && m.events != nil {
+		m.events.Emit(Event{
+			Type:       EventCoreRecoveryRequested,
+			Generation: generation,
+			State:      m.state,
+			Reason:     string(request.reason),
 		})
 	}
-	m.signalRecoveryEvent(eventCoreRecovery)
+	m.mu.RUnlock()
+
+	m.signalRecoveryEvent(eventCoreRecovery, generation)
 	return true
 }
 
-func (m *Manager) signalRecoveryEvent(event internalEvent) {
-	select {
-	case m.eventCh <- event:
+func (m *Manager) signalRecoveryEvent(event internalEvent, generation uint64) {
+	m.mu.RLock()
+	runCtx := m.ctx
+	if generation == 0 ||
+		m.stopped ||
+		m.state == StateStopping ||
+		m.coreGeneration.Load() != generation ||
+		runCtx == nil ||
+		runCtx.Err() != nil {
+		m.mu.RUnlock()
 		return
-	default:
+	}
+	if m.recoveryEventValidatedHook != nil {
+		m.recoveryEventValidatedHook()
+	}
+
+	switch m.enqueueInternalEventLocked(event, generation) {
+	case internalEventEnqueued, internalEventInactive:
+		m.mu.RUnlock()
+		return
+	case internalEventQueueFull:
 	}
 
 	m.modemResetMu.Lock()
-	if m.modemResetDeferred {
+	_, queued := m.nextRecoveryEventLocked()
+	if m.recoveryGeneration != generation || !queued || m.modemResetDeferred {
 		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
 		return
 	}
 	m.modemResetDeferred = true
 	m.modemResetMu.Unlock()
+	m.mu.RUnlock()
 	m.coreRecoveryLogger().Warn("Internal event queue is full; scheduling deferred core recovery event")
 
 	m.scheduleAfter(200*time.Millisecond, m.retryDeferredRecoveryEvent)
 }
 
 func (m *Manager) retryDeferredRecoveryEvent() {
+	m.mu.RLock()
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		generation != 0 &&
+		runCtx != nil &&
+		runCtx.Err() == nil
 	m.modemResetMu.Lock()
 	m.modemResetDeferred = false
+	if !active || m.recoveryGeneration != generation {
+		if !m.modemResetRecovering {
+			m.clearRecoveryStateLocked()
+		}
+		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
+		return
+	}
 	event, ok := m.nextRecoveryEventLocked()
 	m.modemResetMu.Unlock()
+	m.mu.RUnlock()
 	if !ok {
 		return
 	}
-	m.signalRecoveryEvent(event)
+	m.signalRecoveryEvent(event, generation)
 }
 
 func (m *Manager) nextRecoveryEventLocked() (internalEvent, bool) {
@@ -244,35 +369,68 @@ func (m *Manager) nextRecoveryEventLocked() (internalEvent, bool) {
 }
 
 func (m *Manager) beginRecovery(event internalEvent) (recoveryRequest, bool) {
+	return m.beginRecoveryForGeneration(event, m.coreGeneration.Load())
+}
+
+func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneration uint64) (recoveryRequest, bool) {
+	m.mu.RLock()
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		eventGeneration == generation &&
+		generation != 0 &&
+		runCtx != nil &&
+		runCtx.Err() == nil
 	m.modemResetMu.Lock()
-	defer m.modemResetMu.Unlock()
+	defer func() {
+		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
+	}()
 
 	if m.modemResetRecovering {
-		if event == eventModemReset {
-			if m.modemResetPending {
-				m.resetCoalesced.Add(1)
-			} else {
-				m.modemResetPending = true
-			}
-		} else {
+		if event == eventCoreRecovery {
 			m.coreRecoveryCoalesced.Add(1)
+		} else {
+			m.resetCoalesced.Add(1)
 		}
+		return recoveryRequest{}, false
+	}
+	if !active {
+		return recoveryRequest{}, false
+	}
+	if m.recoveryGeneration != generation {
+		m.clearRecoveryStateLocked()
+		return recoveryRequest{}, false
+	}
+
+	// A queued software wake must not consume a later real-reset request. Drop
+	// the superseded software request and let the reset's own envelope perform
+	// the recovery for this exact generation.
+	if event == eventCoreRecovery && m.modemResetEnqueued {
+		m.coreRecoveryEnqueued = false
+		m.coreRecoveryRequest = recoveryRequest{}
+		m.coreRecoveryCoalesced.Add(1)
 		return recoveryRequest{}, false
 	}
 
 	var request recoveryRequest
 	switch {
-	case m.modemResetEnqueued:
+	case event == eventModemReset && m.modemResetEnqueued:
 		request = m.modemResetRequest
 		m.modemResetEnqueued = false
 		if m.coreRecoveryEnqueued {
 			m.coreRecoveryEnqueued = false
 			m.coreRecoveryCoalesced.Add(1)
 		}
-	case m.coreRecoveryEnqueued:
+	case event == eventCoreRecovery && m.coreRecoveryEnqueued:
 		request = m.coreRecoveryRequest
 		m.coreRecoveryEnqueued = false
 	default:
+		return recoveryRequest{}, false
+	}
+	if request.generation == 0 || request.generation != generation {
+		m.clearRecoveryStateLocked()
 		return recoveryRequest{}, false
 	}
 
@@ -281,23 +439,76 @@ func (m *Manager) beginRecovery(event internalEvent) (recoveryRequest, bool) {
 	return request, true
 }
 
-func (m *Manager) finishRecovery() {
-	m.modemResetMu.Lock()
+// finishRecoveryStateLocked retires the active attempt and promotes exactly
+// one preserved follow-up. modemResetMu must be held; the caller also holds
+// m.mu so generation and lifecycle state cannot change around this commit.
+func (m *Manager) finishRecoveryStateLocked(generation uint64) (internalEvent, bool) {
+	if !m.modemResetRecovering || m.recoveryGeneration != generation {
+		return 0, false
+	}
+
 	m.modemResetRecovering = false
 	m.currentRecoveryRequest = recoveryRequest{}
-
 	pendingReset := m.modemResetPending
 	m.modemResetPending = false
 	if pendingReset {
 		m.modemResetEnqueued = true
-		m.modemResetRequest = modemResetRecoveryRequest("pending_after_recovery")
+		request := modemResetRecoveryRequest("pending_after_recovery")
+		request.generation = generation
+		m.modemResetRequest = request
 		m.modemResetEnqueuedAt = time.Time{}
+		m.coreRecoveryRetryPending = false
+		m.coreRecoveryRetryRequest = recoveryRequest{}
+	} else if m.coreRecoveryRetryPending && m.coreRecoveryRetryRequest.generation == generation {
+		m.coreRecoveryEnqueued = true
+		m.coreRecoveryRequest = m.coreRecoveryRetryRequest
+		m.coreRecoveryRetryPending = false
+		m.coreRecoveryRetryRequest = recoveryRequest{}
+	} else if m.coreRecoveryRetryPending {
+		m.coreRecoveryRetryPending = false
+		m.coreRecoveryRetryRequest = recoveryRequest{}
 	}
+
 	event, ok := m.nextRecoveryEventLocked()
+	if !ok {
+		m.modemResetDeferred = false
+		m.recoveryGeneration = 0
+	}
+	return event, ok
+}
+
+func (m *Manager) finishRecovery() {
+	m.mu.RLock()
+	runCtx := m.ctx
+	generation := m.coreGeneration.Load()
+	active := !m.stopped &&
+		m.state != StateStopping &&
+		generation != 0 &&
+		runCtx != nil &&
+		runCtx.Err() == nil
+	if m.finishRecoveryLockedHook != nil {
+		m.finishRecoveryLockedHook()
+	}
+
+	m.modemResetMu.Lock()
+	if !m.modemResetRecovering {
+		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
+		return
+	}
+	if !active || m.recoveryGeneration != generation {
+		m.clearRecoveryStateLocked()
+		m.modemResetMu.Unlock()
+		m.mu.RUnlock()
+		return
+	}
+
+	event, ok := m.finishRecoveryStateLocked(generation)
 	m.modemResetMu.Unlock()
+	m.mu.RUnlock()
 
 	if ok {
-		m.signalRecoveryEvent(event)
+		m.signalRecoveryEvent(event, generation)
 	}
 }
 
