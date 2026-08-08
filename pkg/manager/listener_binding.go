@@ -13,8 +13,10 @@ var errQMIClientEventStreamClosed = errors.New("QMI client event stream closed")
 const listenerIndicationQueueSize = 256
 
 type listenerIndication struct {
-	binding *listenerBinding
-	event   qmi.Event
+	binding       *listenerBinding
+	owner         *serviceOwner
+	ownerRequired bool
+	event         qmi.Event
 }
 
 // listenerBinding owns the indication stream for one exact core transport.
@@ -126,6 +128,7 @@ func (m *Manager) publishListenerBindingLocked(client *qmi.Client, generation ui
 	m.nextListenerBindingID++
 	next := newListenerBinding(m.nextListenerBindingID, generation, client, runCtx)
 	m.replaceListenerBindingLocked(next)
+	m.resetServiceOwnerRegistryForBindingLocked(next)
 	return next
 }
 
@@ -214,13 +217,16 @@ func (m *Manager) queueListenerIndication(runCtx context.Context, binding *liste
 	}
 	m.mu.RLock()
 	usable := m.listenerBindingUsableLocked(binding)
+	owner, ownerRequired := m.serviceOwnerForEventLocked(binding, event)
 	m.mu.RUnlock()
-	if !usable {
+	if !usable || (ownerRequired && owner == nil) {
 		return
 	}
 	select {
 	case <-runCtx.Done():
-	case m.listenerIndicationCh <- listenerIndication{binding: binding, event: event}:
+	case m.listenerIndicationCh <- listenerIndication{
+		binding: binding, owner: owner, ownerRequired: ownerRequired, event: event,
+	}:
 	default:
 		dropped := m.listenerIndicationsDropped.Add(1)
 		// Log only at powers of two. The counter remains exact while a burst
@@ -247,7 +253,7 @@ func (m *Manager) listenerIndicationHandler(runCtx context.Context) {
 			if runCtx.Err() != nil {
 				return
 			}
-			m.handleIndicationForBinding(indication.binding, indication.event)
+			m.handleIndicationForBinding(indication.binding, indication.owner, indication.ownerRequired, indication.event)
 		}
 	}
 }
