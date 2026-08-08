@@ -6056,6 +6056,9 @@ func (m *Manager) handleIndicationForBinding(binding *listenerBinding, owner *se
 }
 
 func (m *Manager) handleModemResetForBinding(binding *listenerBinding, evt qmi.Event) {
+	if m.handleTargetedServiceRevocation(binding, evt) {
+		return
+	}
 	if shouldLogRawIndication(evt) {
 		m.log.Debugf("Indication: type=%d service=0x%02x msg=0x%04x", evt.Type, evt.ServiceID, evt.MessageID)
 	}
