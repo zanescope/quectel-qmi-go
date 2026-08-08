@@ -373,7 +373,7 @@ func (m *Manager) beginRecovery(event internalEvent) (recoveryRequest, bool) {
 }
 
 func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneration uint64) (recoveryRequest, bool) {
-	m.mu.RLock()
+	m.mu.Lock()
 	runCtx := m.ctx
 	generation := m.coreGeneration.Load()
 	active := !m.stopped &&
@@ -385,7 +385,7 @@ func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneratio
 	m.modemResetMu.Lock()
 	defer func() {
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 	}()
 
 	if m.modemResetRecovering {
@@ -436,6 +436,9 @@ func (m *Manager) beginRecoveryForGeneration(event internalEvent, eventGeneratio
 
 	m.modemResetRecovering = true
 	m.currentRecoveryRequest = request
+	m.coreStatusLastErr = ""
+	m.setCorePhaseLocked(CorePhaseRecovering, "recovery_begin", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 	return request, true
 }
 
@@ -478,7 +481,7 @@ func (m *Manager) finishRecoveryStateLocked(generation uint64) (internalEvent, b
 }
 
 func (m *Manager) finishRecovery() {
-	m.mu.RLock()
+	m.mu.Lock()
 	runCtx := m.ctx
 	generation := m.coreGeneration.Load()
 	active := !m.stopped &&
@@ -493,19 +496,30 @@ func (m *Manager) finishRecovery() {
 	m.modemResetMu.Lock()
 	if !m.modemResetRecovering {
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return
 	}
 	if !active || m.recoveryGeneration != generation {
 		m.clearRecoveryStateLocked()
 		m.modemResetMu.Unlock()
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return
 	}
 
+	reason := string(m.currentRecoveryRequest.reason)
 	event, ok := m.finishRecoveryStateLocked(generation)
+	if ok {
+		m.setCorePhaseLocked(CorePhaseRecovering, "recovery_follow_up_queued", reason, nil)
+	} else {
+		stage := m.coreStatusStage
+		if stage == "" || stage == "recovery_begin" {
+			stage = "recovery_failed"
+		}
+		m.setCorePhaseLocked(CorePhaseDegraded, stage, reason, nil)
+	}
+	m.publishCoreStatusLocked()
 	m.modemResetMu.Unlock()
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	if ok {
 		m.signalRecoveryEvent(event, generation)

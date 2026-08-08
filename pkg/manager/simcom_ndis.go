@@ -174,6 +174,7 @@ func (m *Manager) doSIMCOMNDISStatusCheck(ctx context.Context, currentState Stat
 		m.handleV4 = 0
 		m.settings = nil
 		m.state = StateDisconnected
+		m.publishCoreStatusLocked()
 		reconnect := m.cfg.AutoReconnect && m.desiredConnection
 		if m.events != nil {
 			m.events.Emit(Event{

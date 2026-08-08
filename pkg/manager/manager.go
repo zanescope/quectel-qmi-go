@@ -235,6 +235,12 @@ type Manager struct {
 	coreReadyStage       string
 	coreReadyLastErr     string
 	coreReadySince       time.Time
+	corePhase            CorePhase
+	coreStatusStage      string
+	coreStatusReason     string
+	coreStatusLastErr    string
+	coreStatusTerminal   bool
+	coreStatusHub        coreStatusHub
 	desiredConnection    bool
 
 	// Event handling
@@ -656,7 +662,7 @@ func New(cfg Config, logger Logger) *Manager {
 		}
 	}
 
-	return &Manager{
+	m := &Manager{
 		cfg:                   cfg,
 		log:                   baseLog,
 		retryDelays:           append([]time.Duration(nil), cfg.RetryPolicy.ReconnectDelays...),
@@ -667,7 +673,12 @@ func New(cfg Config, logger Logger) *Manager {
 		modemResetDedupWindow: defaultModemResetDedupWindow,
 		modemResetQuietWindow: defaultModemResetQuietWindow,
 		uimRecoverCooldown:    cfg.RecoveryPolicy.ServiceRecoverCooldown,
+		corePhase:             CorePhaseIdle,
 	}
+	m.mu.Lock()
+	m.publishCoreStatusLocked()
+	m.mu.Unlock()
+	return m
 }
 
 // Start initializes and starts the connection manager / Start 初始化并启动连接管理器
@@ -778,6 +789,8 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	m.cancel = runCancel
 	m.lifetimeActive = true
 	generation := m.coreGeneration.Add(1)
+	m.setCorePhaseLocked(CorePhaseStarting, "start_begin", "", nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 	m.resumeScheduledTimersLocked()
 
@@ -788,7 +801,7 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 		operationCancel()
 	}()
 
-	cleanupFailedStart := func() {
+	cleanupFailedStart := func(stage string, cause error) {
 		runCancel()
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), m.cfg.Timeouts.Stop)
 		defer cleanupCancel()
@@ -796,6 +809,9 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 		m.mu.Lock()
 		if m.coreGeneration.Load() == generation && !m.stopped {
 			m.lifetimeActive = false
+			m.state = StateDisconnected
+			m.setCorePhaseLocked(CorePhaseDegraded, stage, "start_failed", cause)
+			m.publishCoreStatusLocked()
 		}
 		m.mu.Unlock()
 	}
@@ -807,8 +823,7 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 		openErr = m.openClientAndAllocateServices(operationCtx, OpenReasonInitial)
 	}
 	if openErr != nil {
-		cleanupFailedStart()
-		m.setState(StateDisconnected)
+		cleanupFailedStart("start_open_failed", openErr)
 		return openErr
 	}
 
@@ -816,8 +831,11 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	stopping := m.state == StateStopping
 	m.mu.RUnlock()
 	if err := operationCtx.Err(); err != nil || stopping || m.coreGeneration.Load() != generation {
-		cleanupFailedStart()
-		m.setState(StateDisconnected)
+		failureErr := err
+		if failureErr == nil {
+			failureErr = context.Canceled
+		}
+		cleanupFailedStart("start_canceled", failureErr)
 		if err != nil {
 			return err
 		}
@@ -826,6 +844,8 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 
 	m.mu.Lock()
 	m.markControlReadyLocked("start_control_ready")
+	m.setCorePhaseLocked(CorePhaseStarting, "start_control_ready", "", nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 
 	// Check SIM status / 检查SIM卡状态
@@ -849,8 +869,7 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	}
 	if startErr != nil {
 		m.mu.Unlock()
-		cleanupFailedStart()
-		m.setState(StateDisconnected)
+		cleanupFailedStart("start_commit_canceled", startErr)
 		return startErr
 	}
 
@@ -858,11 +877,13 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 	go m.eventLoop(runCtx)
 	go m.indicationHandler(runCtx)
 
-	m.markCoreReadyLocked("start_core_ready")
 	if m.state != StateDisconnected {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
 	}
+	m.markCoreReadyLocked("start_core_ready")
+	m.setCorePhaseLocked(CorePhaseReady, "start_core_ready", "", nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 	m.log.Info("QMI core started")
 
@@ -895,6 +916,8 @@ func (m *Manager) stopOnceBody() error {
 		m.state = StateStopping
 	}
 	m.clearRecoveryStateLocked()
+	m.setCorePhaseLocked(CorePhaseStopping, "stop_begin", "", nil)
+	m.publishCoreStatusLocked()
 	m.modemResetMu.Unlock()
 	cancel := m.cancel
 	m.mu.Unlock()
@@ -1121,6 +1144,7 @@ func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error)
 	if m.state == StateConnected || m.state == StateConnecting {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
+		m.publishCoreStatusLocked()
 	}
 	m.mu.Unlock()
 	return true, nil
@@ -1294,11 +1318,19 @@ func (m *Manager) WaitControlReady(ctx context.Context) error {
 	}
 }
 
-// WaitIdentityReady blocks until the full QMI core convergence gate passes.
-// Today that convergence is represented by coreReady and includes identity readability.
+// WaitIdentityReady first waits for the QMI core, then proves that at least one
+// live SIM identity (ICCID or IMSI) is readable. Core readiness alone is not an
+// identity guarantee because recovery may remain usable after identity probes
+// fail.
 func (m *Manager) WaitIdentityReady(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := m.WaitCoreReady(ctx); err != nil {
 		return fmt.Errorf("等待 QMI identity 收敛就绪失败: %w", err)
+	}
+	if err := m.waitIdentityReadable(ctx); err != nil {
+		return fmt.Errorf("wait for readable QMI identity: %w", err)
 	}
 	return nil
 }
@@ -3128,6 +3160,7 @@ func (m *Manager) finishIPRotation(token coreSessionToken, wds *qmi.WDSService, 
 		if m.state != StateDisconnected {
 			m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 			m.state = StateDisconnected
+			m.publishCoreStatusLocked()
 		}
 		disconnected = true
 	}
@@ -3290,6 +3323,7 @@ func (m *Manager) RotateIP() (err error) {
 	if m.state != StateConnected {
 		m.log.Infof("State: %s -> %s", m.state, StateConnected)
 		m.state = StateConnected
+		m.publishCoreStatusLocked()
 	}
 	m.retryCount = 0
 	newSettings := m.settings
@@ -3413,6 +3447,7 @@ registrationLoop:
 	if m.state != StateConnected {
 		m.log.Infof("State: %s -> %s", m.state, StateConnected)
 		m.state = StateConnected
+		m.publishCoreStatusLocked()
 	}
 	m.retryCount = 0
 	newSettings := m.settings
@@ -3451,6 +3486,7 @@ func (m *Manager) setState(s State) {
 	if m.state != s {
 		m.log.Infof("State: %s -> %s", m.state, s)
 		m.state = s
+		m.publishCoreStatusLocked()
 	}
 }
 
@@ -3461,6 +3497,8 @@ func (m *Manager) finishStopState() {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
 	}
+	m.setCorePhaseLocked(CorePhaseStopped, "stop_complete", "", nil)
+	m.publishCoreStatusLocked()
 }
 
 type startupServiceTask struct {
@@ -3922,6 +3960,8 @@ func (m *Manager) cleanupLocked(cleanupCtx context.Context) {
 	m.muxIface = ""
 	m.markControlNotReadyLocked("cleanup")
 	m.markCoreNotReadyLocked("cleanup", nil)
+	m.setCorePhaseLocked(m.corePhase, "cleanup", m.coreStatusReason, nil)
+	m.publishCoreStatusLocked()
 	m.wmsTransportStatus = 0
 	m.wmsTransportKnown = false
 	m.wmsTransportUnsupported = false
@@ -4485,7 +4525,17 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	request.generation = m.coreGeneration.Load()
 	m.mu.RUnlock()
 	result := m.doRecoverCoreAttempt(request)
-	m.emitRecoveryTerminal(result)
+	if result.terminalReason != "" {
+		committed := result.finished
+		if !committed {
+			committed = m.commitScheduledRecoveryTerminal(
+				result.generation, result.terminalReason, result.terminalErr,
+			)
+		}
+		if committed {
+			m.emitRecoveryTerminal(result)
+		}
+	}
 	return result.recovered
 }
 
@@ -4523,6 +4573,12 @@ func (m *Manager) commitHardRecoveryTerminal(result *recoveryAttemptResult) bool
 		return false
 	}
 	m.clearRecoveryStateLocked()
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
+	m.setCorePhaseLocked(CorePhaseTerminal, "recovery_terminal", result.terminalReason, result.terminalErr)
+	m.publishCoreStatusLocked()
 	result.finished = true
 	m.modemResetMu.Unlock()
 	m.mu.Unlock()
@@ -4600,7 +4656,6 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	// ready while it still owns the retired client and services.
 	m.markControlNotReadyLocked("recover_generation_advanced")
 	m.markCoreNotReadyLocked("recover_generation_advanced", nil)
-
 	// A reset can arrive after beginRecovery marks the current recovery active
 	// but before this session generation is advanced. Move the active recovery
 	// bookkeeping to the new generation while m.mu excludes new enqueues, so a
@@ -4611,6 +4666,9 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 		m.currentRecoveryRequest = request
 	}
 	m.modemResetMu.Unlock()
+	m.coreStatusLastErr = ""
+	m.setCorePhaseLocked(CorePhaseRecovering, "recover_generation_advanced", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 
 	m.mu.Unlock()
 	m.resumeScheduledTimersLocked()
@@ -4640,15 +4698,22 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 		m.markControlNotReadyLocked("recover_reinit_services")
 		m.markCoreNotReadyLocked("recover_reinit_services", openErr)
 		isStopping := m.state == StateStopping
+		if !isStopping && m.state != StateDisconnected {
+			m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+			m.state = StateDisconnected
+		}
+		m.setCorePhaseLocked(CorePhaseRecovering, "recover_reinit_services", string(request.reason), openErr)
+		m.publishCoreStatusLocked()
 		m.mu.Unlock()
-		m.setState(StateDisconnected)
 		if ctx.Err() != nil || isStopping {
 			return result
 		}
 		if m.isControlDeviceGone() {
 			m.log.WithError(openErr).Warn("Control device node missing; terminating recovery retries")
+			m.mu.Lock()
 			m.recoverCount = 0
 			m.recoverFirstFailAt = time.Time{}
+			m.mu.Unlock()
 			result.terminalReason, result.terminalErr = "device_removed", openErr
 			return result
 		}
@@ -4671,6 +4736,8 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 
 	m.mu.Lock()
 	m.markControlReadyLocked("recover_control_ready")
+	m.setCorePhaseLocked(CorePhaseRecovering, "recover_control_ready", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 
 	checkSIMErr := m.checkSIMContext(ctx)
@@ -4680,6 +4747,8 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 
 	m.mu.Lock()
 	m.markCoreNotReadyLocked("recover_wait_reset_quiet", nil)
+	m.setCorePhaseLocked(CorePhaseRecovering, "recover_wait_reset_quiet", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 	quietCtx, quietCancel := contextWithMaxTimeout(ctx, m.modemResetQuietWindow+time.Second)
 	quietErr := m.waitResetQuietWindow(quietCtx)
@@ -4687,6 +4756,8 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	if quietErr != nil {
 		m.mu.Lock()
 		m.markCoreNotReadyLocked("recover_wait_reset_quiet", quietErr)
+		m.setCorePhaseLocked(CorePhaseRecovering, "recover_wait_reset_quiet", string(request.reason), quietErr)
+		m.publishCoreStatusLocked()
 		m.mu.Unlock()
 		m.log.WithError(quietErr).Warn("QMI reset quiet-window gate not satisfied")
 		m.mu.RLock()
@@ -4706,6 +4777,8 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 
 	m.mu.Lock()
 	m.markCoreNotReadyLocked("recover_wait_identity", nil)
+	m.setCorePhaseLocked(CorePhaseRecovering, "recover_wait_identity", string(request.reason), nil)
+	m.publishCoreStatusLocked()
 	m.mu.Unlock()
 	identityTimeout := m.cfg.Timeouts.SIMCheck
 	if identityTimeout <= 0 {
@@ -4740,6 +4813,12 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	}
 	if pendingReset {
 		event, queued := m.finishRecoveryStateLocked(generation)
+		if queued {
+			m.setCorePhaseLocked(CorePhaseRecovering, "recovery_follow_up_queued", string(request.reason), nil)
+		} else {
+			m.setCorePhaseLocked(CorePhaseDegraded, "recovery_pending_reset", string(request.reason), nil)
+		}
+		m.publishCoreStatusLocked()
 		result.finished = true
 		m.modemResetMu.Unlock()
 		m.mu.Unlock()
@@ -4758,18 +4837,23 @@ func (m *Manager) doRecoverCoreLocked(ctx context.Context, request recoveryReque
 	m.recoverBackoffMs.Store(0)
 	m.recoverSuccess.Add(1)
 	m.coreRecoverySuccess.Add(1)
-	if m.events != nil {
-		m.events.Emit(Event{
-			Type:       EventCoreRecoverySucceeded,
-			Generation: generation,
-			State:      StateDisconnected,
-			Reason:     string(request.reason),
-		})
-	}
 	nextEvent, followUpQueued := m.finishRecoveryStateLocked(generation)
+	m.coreStatusLastErr = ""
+	if followUpQueued {
+		m.setCorePhaseLocked(CorePhaseRecovering, "recovery_follow_up_queued", string(request.reason), nil)
+	} else {
+		m.setCorePhaseLocked(CorePhaseReady, "recover_converged", string(request.reason), nil)
+	}
+	m.publishCoreStatusLocked()
 	result.finished = true
 	m.modemResetMu.Unlock()
 	m.mu.Unlock()
+	if m.events != nil {
+		m.events.Emit(Event{
+			Type: EventCoreRecoverySucceeded, Generation: generation,
+			State: StateDisconnected, Reason: string(request.reason),
+		})
+	}
 
 	if followUpQueued {
 		m.signalRecoveryEvent(nextEvent, generation)
@@ -4826,19 +4910,52 @@ func (m *Manager) waitIdentityReadable(ctx context.Context) error {
 	tryProbe := func() bool {
 		probeCtx, cancel := contextWithMaxTimeout(ctx, 2*time.Second)
 		defer cancel()
-		if iccid, err := m.GetICCIDStrictLive(probeCtx); err == nil && strings.TrimSpace(iccid) != "" {
-			return true
-		} else if err != nil {
-			lastErr = fmt.Errorf("read ICCID failed: %w", err)
+		if err := probeCtx.Err(); err != nil {
+			lastErr = err
+			return false
 		}
-		if imsi, err := m.GetIMSIStrictLive(probeCtx); err == nil && strings.TrimSpace(imsi) != "" {
+
+		// Bound the first probe to half of the available attempt so a slow
+		// ICCID path cannot consume IMSI's entire deadline. The IMSI probe
+		// receives all remaining time and is skipped after ICCID succeeds,
+		// avoiding duplicate service-recovery side effects.
+		iccidBudget := time.Second
+		if deadline, ok := probeCtx.Deadline(); ok {
+			iccidBudget = time.Until(deadline) / 2
+		}
+		if iccidBudget <= 0 {
+			lastErr = probeCtx.Err()
+			return false
+		}
+		iccidCtx, iccidCancel := contextWithMaxTimeout(probeCtx, iccidBudget)
+		iccid, iccidErr := m.GetICCIDStrictLive(iccidCtx)
+		iccidCancel()
+		if iccidErr == nil && strings.TrimSpace(iccid) != "" {
 			return true
-		} else if err != nil {
-			lastErr = fmt.Errorf("read IMSI failed: %w", err)
+		}
+		if iccidErr != nil {
+			lastErr = fmt.Errorf("read ICCID failed: %w", iccidErr)
+		} else {
+			lastErr = fmt.Errorf("read ICCID returned an empty identity")
+		}
+		if err := probeCtx.Err(); err != nil {
+			lastErr = err
+			return false
+		}
+
+		imsiCtx, imsiCancel := contextWithMaxTimeout(probeCtx, 2*time.Second)
+		imsi, imsiErr := m.GetIMSIStrictLive(imsiCtx)
+		imsiCancel()
+		if imsiErr == nil && strings.TrimSpace(imsi) != "" {
+			return true
+		}
+		if imsiErr != nil {
+			lastErr = fmt.Errorf("read IMSI failed: %w", imsiErr)
+		} else {
+			lastErr = fmt.Errorf("read IMSI returned an empty identity")
 		}
 		return false
 	}
-
 	if tryProbe() {
 		return nil
 	}
@@ -4885,6 +5002,7 @@ func (m *Manager) recoveryExhausted() bool {
 type recoveryRetryResult struct {
 	terminalReason string
 	generation     uint64
+	terminalCommit bool
 }
 
 func (m *Manager) scheduleRecoverRetry(reason string) {
@@ -4897,24 +5015,56 @@ func (m *Manager) scheduleRecoverRetry(reason string) {
 		request.generation = m.coreGeneration.Load()
 		m.mu.RUnlock()
 	}
-	result := m.scheduleRecoverRetryFor(request, reason)
-	if result.terminalReason != "" {
-		m.emitEventForGeneration(Event{
-			Type:   EventRecoveryExhausted,
-			State:  StateDisconnected,
-			Reason: result.terminalReason,
-		}, result.generation)
+	result := m.scheduleRecoverRetryForOptions(request, reason, true)
+	if result.terminalReason != "" && result.terminalCommit {
+		if result.generation != 0 {
+			m.emitEventForGeneration(Event{
+				Type:   EventRecoveryExhausted,
+				State:  StateDisconnected,
+				Reason: result.terminalReason,
+			}, result.generation)
+		}
 	}
 }
 
+func (m *Manager) commitScheduledRecoveryTerminal(generation uint64, reason string, terminalErr error) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.commitScheduledRecoveryTerminalLocked(generation, reason, terminalErr)
+}
+
+// commitScheduledRecoveryTerminalLocked requires m.mu.
+func (m *Manager) commitScheduledRecoveryTerminalLocked(generation uint64, reason string, terminalErr error) bool {
+	runCtx := m.ctx
+	if generation == 0 || m.stopped || m.state == StateStopping ||
+		m.coreGeneration.Load() != generation || runCtx == nil || runCtx.Err() != nil {
+		return false
+	}
+	m.modemResetMu.Lock()
+	m.clearRecoveryStateLocked()
+	m.modemResetMu.Unlock()
+	m.markCoreNotReadyLocked("recovery_terminal", nil)
+	if m.state != StateDisconnected {
+		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
+		m.state = StateDisconnected
+	}
+	m.setCorePhaseLocked(CorePhaseTerminal, "recovery_terminal", reason, terminalErr)
+	m.publishCoreStatusLocked()
+	return true
+}
+
 func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string) recoveryRetryResult {
-	m.mu.RLock()
+	return m.scheduleRecoverRetryForOptions(request, reason, false)
+}
+
+func (m *Manager) scheduleRecoverRetryForOptions(request recoveryRequest, reason string, commitTerminal bool) recoveryRetryResult {
+	m.mu.Lock()
 	generation := m.coreGeneration.Load()
 	runCtx := m.ctx
 	active := !m.stopped && m.state != StateStopping && generation != 0 && runCtx != nil && runCtx.Err() == nil
 	strictGeneration := request.generation == generation
-	m.mu.RUnlock()
 	if !active || !strictGeneration {
+		m.mu.Unlock()
 		return recoveryRetryResult{generation: generation}
 	}
 
@@ -4923,19 +5073,33 @@ func (m *Manager) scheduleRecoverRetryFor(request recoveryRequest, reason string
 		m.recoverFirstFailAt = time.Now()
 	}
 	if m.recoveryExhausted() {
-		m.log.WithField("reason", reason).
-			WithField("recovery_reason", request.reason).
-			WithField("attempts", m.recoverCount).
-			Warn("Core recovery exhausted; stopping retries")
+		attempts := m.recoverCount
 		m.recoverCount = 0
 		m.recoverFirstFailAt = time.Time{}
-		return recoveryRetryResult{terminalReason: "recovery_exhausted", generation: generation}
+		terminalCommitted := false
+		if commitTerminal {
+			terminalCommitted = m.commitScheduledRecoveryTerminalLocked(generation, "recovery_exhausted", nil)
+		}
+		m.mu.Unlock()
+		m.log.WithField("reason", reason).
+			WithField("recovery_reason", request.reason).
+			WithField("attempts", attempts).
+			Warn("Core recovery exhausted; stopping retries")
+		return recoveryRetryResult{
+			terminalReason: "recovery_exhausted",
+			generation:     generation,
+			terminalCommit: terminalCommitted,
+		}
 	}
 	delay := m.getRecoverDelay()
+	attempt := m.recoverCount
+	m.setCorePhaseLocked(CorePhaseRecovering, "recovery_backoff", reason, nil)
+	m.publishCoreStatusLocked()
+	m.mu.Unlock()
 	m.log.
 		WithField("reason", reason).
 		WithField("recovery_reason", request.reason).
-		Infof("Will retry core recovery with backoff in %v (attempt=%d)", delay, m.recoverCount)
+		Infof("Will retry core recovery with backoff in %v (attempt=%d)", delay, attempt)
 	m.scheduleAfter(delay, func() {
 		m.enqueueCoreRecoveryRetry(request, reason)
 	})
@@ -5047,7 +5211,11 @@ func (m *Manager) doConnectLocked(dialCtx context.Context, generation uint64) er
 		m.mu.Unlock()
 		return fmt.Errorf("connection already in progress")
 	}
-	m.state = StateConnecting
+	if m.state != StateConnecting {
+		m.log.Infof("State: %s -> %s", m.state, StateConnecting)
+		m.state = StateConnecting
+		m.publishCoreStatusLocked()
+	}
 	m.mu.Unlock()
 
 	if m.useSIMCOMNDIS() {
@@ -5207,6 +5375,7 @@ func (m *Manager) commitConnected(
 	if m.state != StateConnected {
 		m.log.Infof("State: %s -> %s", m.state, StateConnected)
 		m.state = StateConnected
+		m.publishCoreStatusLocked()
 	}
 	m.retryCount = 0
 	if m.events != nil {
@@ -5393,6 +5562,7 @@ func (m *Manager) doDisconnectLocked(ctx context.Context) error {
 			if m.state != StateDisconnected {
 				m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 				m.state = StateDisconnected
+				m.publishCoreStatusLocked()
 			}
 			publish = m.coreSessionCurrentLocked(token)
 		}
@@ -5611,6 +5781,7 @@ func (m *Manager) doStatusCheck(full bool) {
 			}
 			m.settings = nil
 			m.state = StateDisconnected
+			m.publishCoreStatusLocked()
 			m.mu.Unlock()
 
 			if flushErr := m.flushRotationAddresses(m.dataInterfaceName()); flushErr != nil {
@@ -5660,6 +5831,7 @@ func (m *Manager) handleDialFailure(err error, generation uint64) {
 	if m.state != StateDisconnected {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
+		m.publishCoreStatusLocked()
 	}
 	desiredConnection := m.desiredConnection
 	if m.events != nil {
@@ -6303,6 +6475,7 @@ func (m *Manager) invalidateDataPlaneAfterRadioOff(token coreSessionToken) (hadD
 	if m.state == StateConnected || m.state == StateConnecting {
 		m.log.Infof("State: %s -> %s", m.state, StateDisconnected)
 		m.state = StateDisconnected
+		m.publishCoreStatusLocked()
 	}
 	return hadData, true
 }
