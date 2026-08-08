@@ -474,6 +474,9 @@ func (n *NASService) Close() error {
 }
 
 func (n *NASService) ClientID() uint8 {
+	if n == nil {
+		return 0
+	}
 	return n.clientID
 }
 

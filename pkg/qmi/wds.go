@@ -297,6 +297,9 @@ func (w *WDSService) CloseWithContext(ctx context.Context) error {
 }
 
 func (w *WDSService) ClientID() uint8 {
+	if w == nil {
+		return 0
+	}
 	return w.clientID
 }
 

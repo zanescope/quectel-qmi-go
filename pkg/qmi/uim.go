@@ -315,6 +315,13 @@ func (u *UIMService) Close() error {
 	return u.client.ReleaseClientID(ServiceUIM, u.clientID)
 }
 
+func (u *UIMService) ClientID() uint8 {
+	if u == nil {
+		return 0
+	}
+	return u.clientID
+}
+
 func (u *UIMService) GetCardStatusDetails(ctx context.Context) (*CardStatusDetails, SIMStatus, error) {
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMGetCardStatus, nil)
 	if err != nil {

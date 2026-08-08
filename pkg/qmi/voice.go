@@ -31,6 +31,13 @@ func (v *VOICEService) Close() error {
 	return v.client.ReleaseClientID(ServiceVOICE, v.clientID)
 }
 
+func (v *VOICEService) ClientID() uint8 {
+	if v == nil {
+		return 0
+	}
+	return v.clientID
+}
+
 // ============================================================================
 // VOICE Types / VOICE 类型
 // ============================================================================
