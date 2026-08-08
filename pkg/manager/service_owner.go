@@ -91,6 +91,7 @@ type serviceOwnerPhase uint8
 
 const (
 	serviceOwnerActive serviceOwnerPhase = iota + 1
+	serviceOwnerRevoking
 	serviceOwnerRevoked
 )
 
@@ -172,6 +173,25 @@ func (m *Manager) serviceOwnerCurrentLocked(owner *serviceOwner) bool {
 		m.serviceOwnersByIdentity[owner.identity] == owner
 }
 
+// serviceOwnerRevokingLocked validates the exact owner reserved by a CTL
+// revoke worker. Revoking owners stay indexed so no operation or allocator can
+// publish a replacement before that one worker detaches the slot.
+func (m *Manager) serviceOwnerRevokingLocked(owner *serviceOwner) bool {
+	if owner == nil || owner.phase != serviceOwnerRevoking {
+		return false
+	}
+	binding := m.listenerBinding
+	if !m.serviceOwnerRegistryEnabledLocked(binding) ||
+		owner.coreGeneration != binding.coreGeneration ||
+		owner.listenerBindingID != binding.id ||
+		owner.client != binding.client ||
+		owner.runCtx == nil || owner.runCtx.Err() != nil {
+		return false
+	}
+	return m.serviceOwnersBySlot[owner.slot] == owner &&
+		m.serviceOwnersByIdentity[owner.identity] == owner
+}
+
 // publishServiceOwnerLocked activates one service wrapper. It requires m.mu.
 // A tuple that has ever been retired on this same qmi.Client is rejected: an
 // old indication still buffered below the manager has no allocation epoch and
@@ -193,11 +213,11 @@ func (m *Manager) publishServiceOwnerLocked(slot serviceSlot, clientID uint8, in
 		return nil, fmt.Errorf("%w: slot=%s service=0x%02x client=0x%02x",
 			errServiceOwnerIdentityReused, slot, identity.serviceID, identity.clientID)
 	}
-	if current := m.serviceOwnersByIdentity[identity]; current != nil && current.phase == serviceOwnerActive {
+	if current := m.serviceOwnersByIdentity[identity]; current != nil && current.phase != serviceOwnerRevoked {
 		return nil, fmt.Errorf("%w: requested_slot=%s active_slot=%s service=0x%02x client=0x%02x",
 			errServiceOwnerIdentityCollision, slot, current.slot, identity.serviceID, identity.clientID)
 	}
-	if current := m.serviceOwnersBySlot[slot]; current != nil && current.phase == serviceOwnerActive {
+	if current := m.serviceOwnersBySlot[slot]; current != nil && current.phase != serviceOwnerRevoked {
 		return nil, fmt.Errorf("%w: slot=%s already owns service=0x%02x client=0x%02x",
 			errServiceOwnerIdentityCollision, slot, current.identity.serviceID, current.identity.clientID)
 	}
@@ -402,6 +422,40 @@ func detachManagedServiceIfCurrent[T comparable](
 		}
 	}
 	previous = *field
+	var zero T
+	*field = zero
+	m.revokeServiceOwnerLocked(slot)
+	client = m.client
+	m.mu.Unlock()
+	m.indicationDispatchMu.Unlock()
+	return previous, client, true
+}
+
+// detachRevokingManagedService commits a CTL revoke without sending
+// ReleaseClientID: the modem has already revoked that identity. onDetach runs
+// under m.mu and must not block.
+func detachRevokingManagedService[T comparable](
+	m *Manager,
+	slot serviceSlot,
+	field *T,
+	expected *serviceOwner,
+	onDetach func(T),
+) (previous T, client *qmi.Client, detached bool) {
+	if m == nil || field == nil || expected == nil {
+		return previous, nil, false
+	}
+	m.indicationDispatchMu.Lock()
+	m.mu.Lock()
+	stored, typeMatches := expected.instance.(T)
+	if !typeMatches || stored != *field || expected.slot != slot || !m.serviceOwnerRevokingLocked(expected) {
+		m.mu.Unlock()
+		m.indicationDispatchMu.Unlock()
+		return previous, nil, false
+	}
+	previous = *field
+	if onDetach != nil {
+		onDetach(previous)
+	}
 	var zero T
 	*field = zero
 	m.revokeServiceOwnerLocked(slot)
