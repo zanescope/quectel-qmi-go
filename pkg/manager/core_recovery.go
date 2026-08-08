@@ -113,6 +113,12 @@ func (m *Manager) clearRecoveryStateLocked() {
 }
 
 func (m *Manager) enqueueModemResetEvent(source string) bool {
+	return m.enqueueModemResetEventForBinding(source, nil, nil)
+}
+
+// enqueueModemResetEventForBinding records a reset only if binding still owns
+// the exact live transport. A nil binding preserves the internal/direct path.
+func (m *Manager) enqueueModemResetEventForBinding(source string, binding *listenerBinding, externalEvent *Event) bool {
 	if m == nil {
 		return false
 	}
@@ -130,11 +136,23 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 		generation == 0 ||
 		runCtx == nil ||
 		runCtx.Err() != nil
+	if binding != nil && !m.listenerBindingOwnedLocked(binding) {
+		inactive = true
+	}
 	if inactive {
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Suppress modem reset while manager is stopping")
 		return false
 	}
+	emitExternal := func() {
+		if externalEvent == nil || binding == nil || m.events == nil {
+			return
+		}
+		event := *externalEvent
+		event.Generation = generation
+		m.events.Emit(event)
+	}
+
 	request.generation = generation
 	m.modemResetMu.Lock()
 	if m.modemResetRecovering {
@@ -145,6 +163,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 		}
 		m.recoveryGeneration = generation
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Warn("Preserved modem reset indication while core recovery is running")
 		return true
@@ -155,6 +174,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	if m.modemResetEnqueued {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Coalesced duplicate modem reset indication")
 		return false
@@ -162,6 +182,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	if !m.modemResetEnqueuedAt.IsZero() && now.Sub(m.modemResetEnqueuedAt) < m.modemResetDedupWindow {
 		m.resetCoalesced.Add(1)
 		m.modemResetMu.Unlock()
+		emitExternal()
 		m.mu.RUnlock()
 		m.coreRecoveryLogger().WithField("source", source).Debug("Deduplicated modem reset indication inside debounce window")
 		return false
@@ -171,6 +192,7 @@ func (m *Manager) enqueueModemResetEvent(source string) bool {
 	m.modemResetRequest = request
 	m.recoveryGeneration = generation
 	m.modemResetMu.Unlock()
+	emitExternal()
 	m.mu.RUnlock()
 
 	m.signalRecoveryEvent(eventModemReset, generation)
