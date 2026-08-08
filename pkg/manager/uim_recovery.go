@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
@@ -23,34 +24,51 @@ func withUIMRecoveryValue[T any](m *Manager, op string, fn func(uim *qmi.UIMServ
 		}
 		return zero, err
 	}
+	owner, ownerErr := captureManagedServiceOwner(m, serviceSlotUIM, uim)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	result, err := fn(uim)
 	if err == nil {
-		m.noteServiceOperationSuccess("UIM", op)
+		if !m.serviceOperationOwnerCurrent(owner) {
+			return zero, staleServiceOperationError(serviceSlotUIM)
+		}
+		m.noteServiceOperationSuccessForOwner(owner, "UIM", op)
 		return result, nil
 	}
-	if !m.shouldRecoverUIMError(op, err) {
+	if !m.shouldRecoverUIMErrorForOwner(owner, op, err) {
 		return result, err
 	}
 
 	m.logServiceRecovery("UIM", op, "initial", err, "UIM operation failed; rebinding UIM service")
 
 	m.uimRecoveryMu.Lock()
-	uim, rebindErr := m.rebindUIMService("recover:" + op)
+	uim, rebindErr := m.rebindUIMService("recover:"+op, owner)
 	m.uimRecoveryMu.Unlock()
 	if rebindErr != nil {
+		if errors.Is(rebindErr, errServiceOwnerStale) {
+			return result, err
+		}
 		m.logServiceRecovery("UIM", op, "rebind", rebindErr, "UIM service rebind failed")
 		m.triggerCoreRecoveryFromService("UIM", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: UIM rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
+	retryOwner, ownerErr := captureManagedServiceOwner(m, serviceSlotUIM, uim)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	retryResult, retryErr := fn(uim)
 	if retryErr == nil {
-		m.noteServiceOperationSuccess("UIM", op)
+		if !m.serviceOperationOwnerCurrent(retryOwner) {
+			return zero, staleServiceOperationError(serviceSlotUIM)
+		}
+		m.noteServiceOperationSuccessForOwner(retryOwner, "UIM", op)
 		m.log.WithField("service_name", "UIM").WithField("op", op).WithField("phase", "retry").Info("UIM operation recovered after rebind")
 		return retryResult, nil
 	}
-	if m.shouldRecoverUIMError(op, retryErr) {
+	if m.shouldRecoverUIMErrorForOwner(retryOwner, op, retryErr) {
 		m.logServiceRecovery("UIM", op, "retry", retryErr, "UIM operation still failing after rebind")
 		m.triggerCoreRecoveryFromService("UIM", op, "retry", retryErr)
 	}
@@ -101,15 +119,21 @@ func (m *Manager) ensureUIMService() (*qmi.UIMService, error) {
 	return allocated, nil
 }
 
-func (m *Manager) rebindUIMService(reason string) (*qmi.UIMService, error) {
+func (m *Manager) rebindUIMService(reason string, expected serviceOperationOwner) (*qmi.UIMService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("UIM")
 	}
 	if m.rebindUIMServiceHook != nil {
+		if !m.serviceOperationOwnerCurrent(expected) {
+			return nil, staleServiceOperationError(serviceSlotUIM)
+		}
 		return m.rebindUIMServiceHook(reason)
 	}
 
-	prev, client := detachManagedService(m, serviceSlotUIM, &m.uim)
+	prev, client, detached := detachManagedServiceIfCurrent(m, serviceSlotUIM, &m.uim, expected)
+	if !detached {
+		return nil, staleServiceOperationError(serviceSlotUIM)
+	}
 	if prev != nil {
 		closeErr := prev.Close()
 		if err := uncertainServiceReleaseError(serviceSlotUIM, closeErr); err != nil {
@@ -144,6 +168,10 @@ func (m *Manager) rebindUIMService(reason string) (*qmi.UIMService, error) {
 
 func (m *Manager) shouldRecoverUIMError(op string, err error) bool {
 	return m.shouldRecoverServiceOperationError("UIM", op, err, "uim service not available")
+}
+
+func (m *Manager) shouldRecoverUIMErrorForOwner(owner serviceOperationOwner, op string, err error) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(owner, "UIM", op, err, "uim service not available")
 }
 
 func (m *Manager) triggerCoreRecoveryFromUIM(op string, phase string, cause error) {

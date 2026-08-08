@@ -12,6 +12,7 @@ var (
 	errServiceOwnerIdentityCollision = errors.New("QMI service identity is already active")
 	errServiceOwnerIdentityReused    = errors.New("QMI service identity was reused on the same transport")
 	errServiceOwnerReleaseUncertain  = errors.New("QMI service client release outcome is uncertain")
+	errServiceOwnerStale             = errors.New("QMI service owner is no longer current")
 )
 
 type serviceSlot uint8
@@ -290,6 +291,58 @@ type managedService interface {
 	Close() error
 }
 
+// serviceOperationOwner is captured immediately before a service operation.
+// required is false only for legacy test managers that never published an
+// authoritative listener/service registry.
+type serviceOperationOwner struct {
+	owner    *serviceOwner
+	required bool
+}
+
+func captureManagedServiceOwner[T comparable](m *Manager, slot serviceSlot, instance T) (serviceOperationOwner, error) {
+	if m == nil {
+		return serviceOperationOwner{required: true}, ErrServiceNotReady(slot.String())
+	}
+
+	m.mu.RLock()
+	binding := m.listenerBinding
+	if !m.serviceOwnerRegistryEnabledLocked(binding) {
+		authoritative := m.serviceOwnerClient != nil || m.serviceOwnerGeneration != 0 || m.serviceOwnerBindingID != 0
+		m.mu.RUnlock()
+		if authoritative {
+			return serviceOperationOwner{required: true}, fmt.Errorf("%w: slot=%s", errServiceOwnerStale, slot)
+		}
+		return serviceOperationOwner{}, nil
+	}
+
+	owner := m.serviceOwnersBySlot[slot]
+	var stored T
+	typeMatches := false
+	if owner != nil {
+		stored, typeMatches = owner.instance.(T)
+	}
+	current := owner != nil && typeMatches && stored == instance && m.serviceOwnerCurrentLocked(owner)
+	m.mu.RUnlock()
+	if !current {
+		return serviceOperationOwner{required: true}, fmt.Errorf("%w: slot=%s", errServiceOwnerStale, slot)
+	}
+	return serviceOperationOwner{owner: owner, required: true}, nil
+}
+
+func (m *Manager) serviceOperationOwnerCurrent(token serviceOperationOwner) bool {
+	if !token.required {
+		return true
+	}
+	if m == nil || token.owner == nil {
+		return false
+	}
+	return m.serviceOwnerCurrent(token.owner)
+}
+
+func staleServiceOperationError(slot serviceSlot) error {
+	return fmt.Errorf("%w: slot=%s", errServiceOwnerStale, slot)
+}
+
 // installManagedService publishes the field and owner in one state commit.
 // Candidate Close, when needed, happens after all manager locks are released.
 func installManagedService[T interface {
@@ -322,13 +375,32 @@ func installManagedService[T interface {
 	return nil
 }
 
-// detachManagedService revokes ownership before any ReleaseClientID I/O.
-func detachManagedService[T comparable](m *Manager, slot serviceSlot, field *T) (previous T, client *qmi.Client) {
+// detachManagedServiceIfCurrent revokes ownership before any ReleaseClientID
+// I/O, but only when the operation still owns the exact published instance.
+func detachManagedServiceIfCurrent[T comparable](
+	m *Manager,
+	slot serviceSlot,
+	field *T,
+	expected serviceOperationOwner,
+) (previous T, client *qmi.Client, detached bool) {
 	if m == nil || field == nil {
-		return previous, nil
+		return previous, nil, false
 	}
 	m.indicationDispatchMu.Lock()
 	m.mu.Lock()
+	if expected.required {
+		owner := expected.owner
+		var stored T
+		typeMatches := false
+		if owner != nil {
+			stored, typeMatches = owner.instance.(T)
+		}
+		if owner == nil || !typeMatches || stored != *field || owner.slot != slot || !m.serviceOwnerCurrentLocked(owner) {
+			m.mu.Unlock()
+			m.indicationDispatchMu.Unlock()
+			return previous, nil, false
+		}
+	}
 	previous = *field
 	var zero T
 	*field = zero
@@ -336,7 +408,7 @@ func detachManagedService[T comparable](m *Manager, slot serviceSlot, field *T) 
 	client = m.client
 	m.mu.Unlock()
 	m.indicationDispatchMu.Unlock()
-	return previous, client
+	return previous, client, true
 }
 
 func serviceReleaseAllowsReallocate(err error) bool {
