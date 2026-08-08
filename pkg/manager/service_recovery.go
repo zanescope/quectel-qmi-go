@@ -12,8 +12,9 @@ import (
 )
 
 type serviceTimeoutKey struct {
-	service string
-	op      string
+	service    string
+	op         string
+	ownerEpoch uint64
 }
 
 type serviceTimeoutWindow struct {
@@ -72,17 +73,37 @@ func isServiceTimeoutError(err error) bool {
 }
 
 func (m *Manager) shouldRecoverServiceOperationError(service string, op string, err error, serviceUnavailableText string) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(serviceOperationOwner{}, service, op, err, serviceUnavailableText)
+}
+
+func (m *Manager) shouldRecoverServiceOperationErrorForOwner(
+	owner serviceOperationOwner,
+	service string,
+	op string,
+	err error,
+	serviceUnavailableText string,
+) bool {
+	if !m.serviceOperationOwnerCurrent(owner) {
+		return false
+	}
 	if shouldRecoverServiceError(service, err, serviceUnavailableText) {
 		return true
 	}
 	if !isServiceTimeoutError(err) {
 		return false
 	}
-	return m.recordServiceTimeoutFailure(service, op, err)
+	return m.recordServiceTimeoutFailureForOwner(owner, service, op, err)
 }
 
 func (m *Manager) recordServiceTimeoutFailure(service string, op string, err error) bool {
+	return m.recordServiceTimeoutFailureForOwner(serviceOperationOwner{}, service, op, err)
+}
+
+func (m *Manager) recordServiceTimeoutFailureForOwner(owner serviceOperationOwner, service string, op string, err error) bool {
 	if m == nil {
+		return false
+	}
+	if !m.serviceOperationOwnerCurrent(owner) {
 		return false
 	}
 	m.serviceTimeouts.Add(1)
@@ -107,6 +128,9 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 		service: strings.ToUpper(strings.TrimSpace(service)),
 		op:      strings.TrimSpace(op),
 	}
+	if owner.owner != nil {
+		key.ownerEpoch = owner.owner.epoch
+	}
 	if key.op == "" {
 		key.op = "*"
 	}
@@ -128,6 +152,7 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 	entry := m.log.
 		WithField("service_name", key.service).
 		WithField("op", key.op).
+		WithField("owner_epoch", key.ownerEpoch).
 		WithField("timeout_count", state.count).
 		WithField("timeout_threshold", threshold).
 		WithField("timeout_window_ms", window.Milliseconds())
@@ -228,12 +253,22 @@ func (m *Manager) clearTimeoutStormCandidates() {
 }
 
 func (m *Manager) noteServiceOperationSuccess(service string, op string) {
+	m.noteServiceOperationSuccessForOwner(serviceOperationOwner{}, service, op)
+}
+
+func (m *Manager) noteServiceOperationSuccessForOwner(owner serviceOperationOwner, service string, op string) {
 	if m == nil {
+		return
+	}
+	if !m.serviceOperationOwnerCurrent(owner) {
 		return
 	}
 	key := serviceTimeoutKey{
 		service: strings.ToUpper(strings.TrimSpace(service)),
 		op:      strings.TrimSpace(op),
+	}
+	if owner.owner != nil {
+		key.ownerEpoch = owner.owner.epoch
 	}
 	if key.op == "" {
 		key.op = "*"
@@ -370,34 +405,51 @@ func withDMSRecoveryValue[T any](m *Manager, op string, fn func(dms *qmi.DMSServ
 		m.triggerCoreRecoveryForUnsafeServiceOwner("DMS", op, "ensure", err)
 		return zero, err
 	}
+	owner, ownerErr := captureManagedServiceOwner(m, serviceSlotDMS, dms)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	result, err := fn(dms)
 	if err == nil {
-		m.noteServiceOperationSuccess("DMS", op)
+		if !m.serviceOperationOwnerCurrent(owner) {
+			return zero, staleServiceOperationError(serviceSlotDMS)
+		}
+		m.noteServiceOperationSuccessForOwner(owner, "DMS", op)
 		return result, nil
 	}
-	if !m.shouldRecoverDMSError(op, err) {
+	if !m.shouldRecoverDMSErrorForOwner(owner, op, err) {
 		return result, err
 	}
 
 	m.logServiceRecovery("DMS", op, "initial", err, "DMS operation failed; rebinding DMS service")
 
 	m.dmsRecoveryMu.Lock()
-	dms, rebindErr := m.rebindDMSService("recover:" + op)
+	dms, rebindErr := m.rebindDMSService("recover:"+op, owner)
 	m.dmsRecoveryMu.Unlock()
 	if rebindErr != nil {
+		if errors.Is(rebindErr, errServiceOwnerStale) {
+			return result, err
+		}
 		m.logServiceRecovery("DMS", op, "rebind", rebindErr, "DMS service rebind failed (core recovery skipped)")
 		m.triggerCoreRecoveryForUnsafeServiceOwner("DMS", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: DMS rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
+	retryOwner, ownerErr := captureManagedServiceOwner(m, serviceSlotDMS, dms)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	retryResult, retryErr := fn(dms)
 	if retryErr == nil {
-		m.noteServiceOperationSuccess("DMS", op)
+		if !m.serviceOperationOwnerCurrent(retryOwner) {
+			return zero, staleServiceOperationError(serviceSlotDMS)
+		}
+		m.noteServiceOperationSuccessForOwner(retryOwner, "DMS", op)
 		m.log.WithField("service_name", "DMS").WithField("op", op).WithField("phase", "retry").Info("DMS operation recovered after rebind")
 		return retryResult, nil
 	}
-	if m.shouldRecoverDMSError(op, retryErr) {
+	if m.shouldRecoverDMSErrorForOwner(retryOwner, op, retryErr) {
 		m.logServiceRecovery("DMS", op, "retry", retryErr, "DMS operation still failing after rebind; escalating to core recovery")
 		m.triggerCoreRecoveryFromService("DMS", op, "retry", retryErr)
 	}
@@ -448,15 +500,21 @@ func (m *Manager) ensureDMSService() (*qmi.DMSService, error) {
 	return allocated, nil
 }
 
-func (m *Manager) rebindDMSService(reason string) (*qmi.DMSService, error) {
+func (m *Manager) rebindDMSService(reason string, expected serviceOperationOwner) (*qmi.DMSService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("DMS")
 	}
 	if m.rebindDMSServiceHook != nil {
+		if !m.serviceOperationOwnerCurrent(expected) {
+			return nil, staleServiceOperationError(serviceSlotDMS)
+		}
 		return m.rebindDMSServiceHook(reason)
 	}
 
-	prev, client := detachManagedService(m, serviceSlotDMS, &m.dms)
+	prev, client, detached := detachManagedServiceIfCurrent(m, serviceSlotDMS, &m.dms, expected)
+	if !detached {
+		return nil, staleServiceOperationError(serviceSlotDMS)
+	}
 	if prev != nil {
 		closeErr := prev.Close()
 		if err := uncertainServiceReleaseError(serviceSlotDMS, closeErr); err != nil {
@@ -483,6 +541,10 @@ func (m *Manager) shouldRecoverDMSError(op string, err error) bool {
 	return m.shouldRecoverServiceOperationError("DMS", op, err, "dms service not available")
 }
 
+func (m *Manager) shouldRecoverDMSErrorForOwner(owner serviceOperationOwner, op string, err error) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(owner, "DMS", op, err, "dms service not available")
+}
+
 func (m *Manager) withNASRecovery(op string, fn func(nas *qmi.NASService) error) error {
 	_, err := withNASRecoveryValue(m, op, func(nas *qmi.NASService) (struct{}, error) {
 		return struct{}{}, fn(nas)
@@ -500,34 +562,51 @@ func withNASRecoveryValue[T any](m *Manager, op string, fn func(nas *qmi.NASServ
 		}
 		return zero, err
 	}
+	owner, ownerErr := captureManagedServiceOwner(m, serviceSlotNAS, nas)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	result, err := fn(nas)
 	if err == nil {
-		m.noteServiceOperationSuccess("NAS", op)
+		if !m.serviceOperationOwnerCurrent(owner) {
+			return zero, staleServiceOperationError(serviceSlotNAS)
+		}
+		m.noteServiceOperationSuccessForOwner(owner, "NAS", op)
 		return result, nil
 	}
-	if !m.shouldRecoverNASError(op, err) {
+	if !m.shouldRecoverNASErrorForOwner(owner, op, err) {
 		return result, err
 	}
 
 	m.logServiceRecovery("NAS", op, "initial", err, "NAS operation failed; rebinding NAS service")
 
 	m.nasRecoveryMu.Lock()
-	nas, rebindErr := m.rebindNASService("recover:" + op)
+	nas, rebindErr := m.rebindNASService("recover:"+op, owner)
 	m.nasRecoveryMu.Unlock()
 	if rebindErr != nil {
+		if errors.Is(rebindErr, errServiceOwnerStale) {
+			return result, err
+		}
 		m.logServiceRecovery("NAS", op, "rebind", rebindErr, "NAS service rebind failed")
 		m.triggerCoreRecoveryFromService("NAS", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: NAS rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
+	retryOwner, ownerErr := captureManagedServiceOwner(m, serviceSlotNAS, nas)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	retryResult, retryErr := fn(nas)
 	if retryErr == nil {
-		m.noteServiceOperationSuccess("NAS", op)
+		if !m.serviceOperationOwnerCurrent(retryOwner) {
+			return zero, staleServiceOperationError(serviceSlotNAS)
+		}
+		m.noteServiceOperationSuccessForOwner(retryOwner, "NAS", op)
 		m.log.WithField("service_name", "NAS").WithField("op", op).WithField("phase", "retry").Info("NAS operation recovered after rebind")
 		return retryResult, nil
 	}
-	if m.shouldRecoverNASError(op, retryErr) {
+	if m.shouldRecoverNASErrorForOwner(retryOwner, op, retryErr) {
 		m.logServiceRecovery("NAS", op, "retry", retryErr, "NAS operation still failing after rebind")
 		m.triggerCoreRecoveryFromService("NAS", op, "retry", retryErr)
 	}
@@ -578,15 +657,21 @@ func (m *Manager) ensureNASService() (*qmi.NASService, error) {
 	return allocated, nil
 }
 
-func (m *Manager) rebindNASService(reason string) (*qmi.NASService, error) {
+func (m *Manager) rebindNASService(reason string, expected serviceOperationOwner) (*qmi.NASService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("NAS")
 	}
 	if m.rebindNASServiceHook != nil {
+		if !m.serviceOperationOwnerCurrent(expected) {
+			return nil, staleServiceOperationError(serviceSlotNAS)
+		}
 		return m.rebindNASServiceHook(reason)
 	}
 
-	prev, client := detachManagedService(m, serviceSlotNAS, &m.nas)
+	prev, client, detached := detachManagedServiceIfCurrent(m, serviceSlotNAS, &m.nas, expected)
+	if !detached {
+		return nil, staleServiceOperationError(serviceSlotNAS)
+	}
 	if prev != nil {
 		closeErr := prev.Close()
 		if err := uncertainServiceReleaseError(serviceSlotNAS, closeErr); err != nil {
@@ -613,6 +698,10 @@ func (m *Manager) shouldRecoverNASError(op string, err error) bool {
 	return m.shouldRecoverServiceOperationError("NAS", op, err, "nas service not available")
 }
 
+func (m *Manager) shouldRecoverNASErrorForOwner(owner serviceOperationOwner, op string, err error) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(owner, "NAS", op, err, "nas service not available")
+}
+
 func (m *Manager) withWMSRecovery(op string, fn func(wms *qmi.WMSService) error) error {
 	_, err := withWMSRecoveryValue(m, op, func(wms *qmi.WMSService) (struct{}, error) {
 		return struct{}{}, fn(wms)
@@ -631,34 +720,51 @@ func withWMSRecoveryValue[T any](m *Manager, op string, fn func(wms *qmi.WMSServ
 		m.triggerCoreRecoveryForUnsafeServiceOwner("WMS", op, "ensure", err)
 		return zero, err
 	}
+	owner, ownerErr := captureManagedServiceOwner(m, serviceSlotWMS, wms)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	result, err := fn(wms)
 	if err == nil {
-		m.noteServiceOperationSuccess("WMS", op)
+		if !m.serviceOperationOwnerCurrent(owner) {
+			return zero, staleServiceOperationError(serviceSlotWMS)
+		}
+		m.noteServiceOperationSuccessForOwner(owner, "WMS", op)
 		return result, nil
 	}
-	if !m.shouldRecoverWMSError(op, err) {
+	if !m.shouldRecoverWMSErrorForOwner(owner, op, err) {
 		return result, err
 	}
 
 	m.logServiceRecovery("WMS", op, "initial", err, "WMS operation failed; rebinding WMS service")
 
 	m.wmsRecoveryMu.Lock()
-	wms, rebindErr := m.rebindWMSService("recover:" + op)
+	wms, rebindErr := m.rebindWMSService("recover:"+op, owner)
 	m.wmsRecoveryMu.Unlock()
 	if rebindErr != nil {
+		if errors.Is(rebindErr, errServiceOwnerStale) {
+			return result, err
+		}
 		m.logServiceRecovery("WMS", op, "rebind", rebindErr, "WMS service rebind failed (core recovery skipped)")
 		m.triggerCoreRecoveryForUnsafeServiceOwner("WMS", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: WMS rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
+	retryOwner, ownerErr := captureManagedServiceOwner(m, serviceSlotWMS, wms)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	retryResult, retryErr := fn(wms)
 	if retryErr == nil {
-		m.noteServiceOperationSuccess("WMS", op)
+		if !m.serviceOperationOwnerCurrent(retryOwner) {
+			return zero, staleServiceOperationError(serviceSlotWMS)
+		}
+		m.noteServiceOperationSuccessForOwner(retryOwner, "WMS", op)
 		m.log.WithField("service_name", "WMS").WithField("op", op).WithField("phase", "retry").Info("WMS operation recovered after rebind")
 		return retryResult, nil
 	}
-	if m.shouldRecoverWMSError(op, retryErr) {
+	if m.shouldRecoverWMSErrorForOwner(retryOwner, op, retryErr) {
 		m.logServiceRecovery("WMS", op, "retry", retryErr, "WMS operation still failing after rebind (core recovery skipped)")
 	}
 	return retryResult, retryErr
@@ -708,11 +814,14 @@ func (m *Manager) ensureWMSService() (*qmi.WMSService, error) {
 	return allocated, nil
 }
 
-func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
+func (m *Manager) rebindWMSService(reason string, expected serviceOperationOwner) (*qmi.WMSService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("WMS")
 	}
 	if m.rebindWMSServiceHook != nil {
+		if !m.serviceOperationOwnerCurrent(expected) {
+			return nil, staleServiceOperationError(serviceSlotWMS)
+		}
 		rebound, err := m.rebindWMSServiceHook(reason)
 		if err == nil && rebound != nil {
 			m.maybeReplayWMSStateAfterRebind(reason)
@@ -720,7 +829,10 @@ func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
 		return rebound, err
 	}
 
-	prev, client := detachManagedService(m, serviceSlotWMS, &m.wms)
+	prev, client, detached := detachManagedServiceIfCurrent(m, serviceSlotWMS, &m.wms, expected)
+	if !detached {
+		return nil, staleServiceOperationError(serviceSlotWMS)
+	}
 	if prev != nil {
 		closeErr := prev.Close()
 		if err := uncertainServiceReleaseError(serviceSlotWMS, closeErr); err != nil {
@@ -748,6 +860,10 @@ func (m *Manager) shouldRecoverWMSError(op string, err error) bool {
 	return m.shouldRecoverServiceOperationError("WMS", op, err, "wms service not available")
 }
 
+func (m *Manager) shouldRecoverWMSErrorForOwner(owner serviceOperationOwner, op string, err error) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(owner, "WMS", op, err, "wms service not available")
+}
+
 func (m *Manager) withVOICERecovery(op string, fn func(voice *qmi.VOICEService) error) error {
 	_, err := withVOICERecoveryValue(m, op, func(voice *qmi.VOICEService) (struct{}, error) {
 		return struct{}{}, fn(voice)
@@ -766,34 +882,51 @@ func withVOICERecoveryValue[T any](m *Manager, op string, fn func(voice *qmi.VOI
 		m.triggerCoreRecoveryForUnsafeServiceOwner("VOICE", op, "ensure", err)
 		return zero, err
 	}
+	owner, ownerErr := captureManagedServiceOwner(m, serviceSlotVOICE, voice)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	result, err := fn(voice)
 	if err == nil {
-		m.noteServiceOperationSuccess("VOICE", op)
+		if !m.serviceOperationOwnerCurrent(owner) {
+			return zero, staleServiceOperationError(serviceSlotVOICE)
+		}
+		m.noteServiceOperationSuccessForOwner(owner, "VOICE", op)
 		return result, nil
 	}
-	if !m.shouldRecoverVOICEError(op, err) {
+	if !m.shouldRecoverVOICEErrorForOwner(owner, op, err) {
 		return result, err
 	}
 
 	m.logServiceRecovery("VOICE", op, "initial", err, "VOICE operation failed; rebinding VOICE service")
 
 	m.voiceRecoveryMu.Lock()
-	voice, rebindErr := m.rebindVOICEService("recover:" + op)
+	voice, rebindErr := m.rebindVOICEService("recover:"+op, owner)
 	m.voiceRecoveryMu.Unlock()
 	if rebindErr != nil {
+		if errors.Is(rebindErr, errServiceOwnerStale) {
+			return result, err
+		}
 		m.logServiceRecovery("VOICE", op, "rebind", rebindErr, "VOICE service rebind failed (core recovery skipped)")
 		m.triggerCoreRecoveryForUnsafeServiceOwner("VOICE", op, "rebind", rebindErr)
 		return zero, fmt.Errorf("%s: VOICE rebind failed: %w (initial=%v)", op, rebindErr, err)
 	}
+	retryOwner, ownerErr := captureManagedServiceOwner(m, serviceSlotVOICE, voice)
+	if ownerErr != nil {
+		return zero, ownerErr
+	}
 
 	retryResult, retryErr := fn(voice)
 	if retryErr == nil {
-		m.noteServiceOperationSuccess("VOICE", op)
+		if !m.serviceOperationOwnerCurrent(retryOwner) {
+			return zero, staleServiceOperationError(serviceSlotVOICE)
+		}
+		m.noteServiceOperationSuccessForOwner(retryOwner, "VOICE", op)
 		m.log.WithField("service_name", "VOICE").WithField("op", op).WithField("phase", "retry").Info("VOICE operation recovered after rebind")
 		return retryResult, nil
 	}
-	if m.shouldRecoverVOICEError(op, retryErr) {
+	if m.shouldRecoverVOICEErrorForOwner(retryOwner, op, retryErr) {
 		m.logServiceRecovery("VOICE", op, "retry", retryErr, "VOICE operation still failing after rebind (core recovery skipped)")
 	}
 	return retryResult, retryErr
@@ -843,15 +976,21 @@ func (m *Manager) ensureVOICEService() (*qmi.VOICEService, error) {
 	return allocated, nil
 }
 
-func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
+func (m *Manager) rebindVOICEService(reason string, expected serviceOperationOwner) (*qmi.VOICEService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("VOICE")
 	}
 	if m.rebindVOICEServiceHook != nil {
+		if !m.serviceOperationOwnerCurrent(expected) {
+			return nil, staleServiceOperationError(serviceSlotVOICE)
+		}
 		return m.rebindVOICEServiceHook(reason)
 	}
 
-	prev, client := detachManagedService(m, serviceSlotVOICE, &m.voice)
+	prev, client, detached := detachManagedServiceIfCurrent(m, serviceSlotVOICE, &m.voice, expected)
+	if !detached {
+		return nil, staleServiceOperationError(serviceSlotVOICE)
+	}
 	if prev != nil {
 		closeErr := prev.Close()
 		if err := uncertainServiceReleaseError(serviceSlotVOICE, closeErr); err != nil {
@@ -876,4 +1015,8 @@ func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
 
 func (m *Manager) shouldRecoverVOICEError(op string, err error) bool {
 	return m.shouldRecoverServiceOperationError("VOICE", op, err, "voice service not available")
+}
+
+func (m *Manager) shouldRecoverVOICEErrorForOwner(owner serviceOperationOwner, op string, err error) bool {
+	return m.shouldRecoverServiceOperationErrorForOwner(owner, "VOICE", op, err, "voice service not available")
 }
